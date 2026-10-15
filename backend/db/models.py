@@ -1,4 +1,5 @@
-"""Database models for Milestone 2 (design doc section 6).
+"""Database models (design doc section 6): Milestone 2 tables plus the
+Milestone 3 simulation tables.
 
 A hand's source of truth is (deck seed, button, blinds, starting stacks,
 action sequence); ``result`` and ``board`` are derived and kept for queries.
@@ -96,3 +97,36 @@ class ActionRow(Base):
     reason: Mapped[str | None] = mapped_column(String(256))
 
     hand: Mapped[Hand] = relationship(back_populates="actions")
+
+
+class SimulationRun(Base):
+    __tablename__ = "simulation_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    agents: Mapped[list[Any]] = mapped_column(JSON)  # [{name, kind, params}]
+    seed: Mapped[int] = mapped_column(BigInteger)
+    n_hands: Mapped[int] = mapped_column(Integer)
+    git_commit: Mapped[str | None] = mapped_column(String(64))
+    config: Mapped[dict[str, Any]] = mapped_column(JSON)
+    seconds: Mapped[float] = mapped_column()
+    data_path: Mapped[str | None] = mapped_column(String(512))  # Parquet directory
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    results: Mapped[list[BenchmarkResult]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class BenchmarkResult(Base):
+    __tablename__ = "benchmark_results"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("simulation_runs.id"), index=True)
+    agent: Mapped[str] = mapped_column(String(64))
+    hands: Mapped[int] = mapped_column(Integer)
+    bb_per_100: Mapped[float] = mapped_column()
+    stddev: Mapped[float | None] = mapped_column()
+    ci_low: Mapped[float | None] = mapped_column()
+    ci_high: Mapped[float | None] = mapped_column()
+
+    run: Mapped[SimulationRun] = relationship(back_populates="results")

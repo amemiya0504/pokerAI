@@ -8,7 +8,8 @@
 |---|---|
 | M1 · 2～9 人 NLHE 引擎 | ✅ 完成（見下方驗收結果） |
 | M2 · 網頁牌桌 Human vs AI | ✅ 完成（見下方驗收結果） |
-| M3～M10 | 未開始 |
+| M3 · AI vs AI 大量模擬 | ✅ 完成（見下方驗收結果） |
+| M4～M10 | 未開始 |
 
 ## 快速開始
 
@@ -17,7 +18,7 @@
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
-pip install -e ".[web,dev,oracle]"
+pip install -e ".[web,sim,dev,oracle]"
 ```
 
 ### 網頁牌桌（M2）
@@ -40,6 +41,14 @@ scripts/run_tests.sh               # Windows: scripts\run_tests.ps1
 ```
 
 端對端測試需要建好的前端與 Playwright Chromium（`python -m playwright install chromium`）；缺少時會自動跳過。Linux 若缺系統函式庫，執行 `sudo .venv/bin/python -m playwright install-deps chromium`。
+
+### AI vs AI 模擬（M3）
+
+```bash
+python -m backend.arena rule random station --deals 20000 --seed 1 --out out/arena/run1 --db sqlite:///poker.db
+```
+
+Agent 寫成 `kind` 或 `name=kind`（kind：`rule`、`random`、`station`），同一種可用不同名字重複出現。每個 deal 會依座位輪換打 N 次（N = Agent 數），所以總手數 = deals × N。`--workers` 預設使用全部 CPU，`--boundary process` 讓每個 Agent 在獨立行程執行。
 
 ### CLI 示範
 
@@ -64,6 +73,8 @@ backend/
   agents/
     base.py          # Agent 介面、Decision、StrategySource（五級）
     baseline.py      # RandomAgent、CallingStationAgent（僅供測試）
+    rule_based.py    # RuleBasedAgent：Chen 公式 + 成手強度與底池賠率（HEURISTIC）
+  arena/             # M3：鏡像牌局模擬、多進程、bb/100 統計、Parquet 與資料庫輸出
   db/                # SQLAlchemy 2 模型、Alembic 遷移、存取函式
   api/
     app.py           # FastAPI：REST（牌桌、歷史）+ 每張牌桌一條 WebSocket
@@ -132,3 +143,37 @@ BET / RAISE 的 `amount` 是「加注到」的本輪總額。全下不是獨立�
 - **其他**：伺服器重啟後牌桌可從資料庫恢復（籌碼、手數、按鈕位置）；非法動作會回傳錯誤訊息，不會改變狀態；Windows 與 Linux 都通過後端測試。
 
 M2 的 AI 只有基準 Agent（隨機、跟注站），策略型 AI 從 M4 開始。AI 籌碼歸零時會自動補回起始籌碼；你則需按「補充籌碼」。
+
+## M3 驗收結果
+
+**方法**：鏡像牌局（duplicate）。每個 deal 用同一副牌，讓 Agent 依座位循環輪換各打一次，每個 Agent 都會在每個位置拿到每個座位的牌；每手籌碼重設為 100 BB，按鈕固定在 0 號座位。所有隨機來源都由主種子依（deal、輪換、Agent）派生，與 worker 數量和分批方式無關。
+
+**統計**：同一 deal 的各手彼此相關，所以以 deal 為獨立單位：取每個 Agent 在該 deal 的平均輸贏，再以這些區塊平均值的平均數與標準誤，搭配 Student-t 分位數計算 95% 信賴區間。
+
+- **同種子結果完全相同**：1、3、4、16 個 worker 跑出的逐手資料與統計逐位元相同；換種子則不同。同一組設定在 Windows 與 Linux 上的結果也完全一致。
+- **輸出 bb/100 與 95% 信賴區間**：CLI、`summary.json` 與資料庫 `benchmark_results` 都有 bb/100、標準差、信賴區間；以已知平均的合成資料重複 2,000 次，區間涵蓋率落在 93.5%～96.5%。
+- **鏡像牌局正確**：相同且決定性的 Agent（2、3、6 人）每個 deal 的淨輸贏都**剛好為 0**；每手零和；每個 Agent 坐過每個座位。
+- **可重播**：`hands.parquet` 每列保存牌堆種子與動作序列，測試逐手重建後與 `players.parquet` 的輸贏完全一致。
+- **隔離**：`inline` 模式下 Agent 拿到的是不可變的 `PlayerView`，改不動牌局；`process` 模式下 Agent 在獨立行程，只透過 JSON 資料溝通。兩種模式的結果完全相同（同時證明 Agent 只依賴可序列化的資料）。
+- **紀錄**：每次模擬記錄主種子、git commit（有未提交變更時加 `-dirty`）、Agent 設定與耗時（資料表 `simulation_runs`、`benchmark_results`，Alembic 遷移 0002）。
+
+### 吞吐量（24 核心 WSL2，6 人桌、規則/隨機/跟注站 Agent）
+
+| worker 數 | 每秒手數 |
+|---|---|
+| 1 | 約 1,400 |
+| 8 | 約 8,100 |
+| 16 | 約 12,500 |
+| 24 | 約 14,100 |
+| 1（`process` 隔離） | 約 130 |
+
+### 基準結果（種子 1）
+
+| 對戰 | 手數 | 結果（bb/100，95% 信賴區間） |
+|---|---|---|
+| 單挑 rule vs station | 100,000 | rule +153.7 [149.0, 158.3] |
+| 單挑 rule vs random | 100,000 | rule +107.5 [98.8, 116.1] |
+| 6 人 rule×2、random×2、station×2 | 120,000 | rule +516 / +507；station +66 / +45；random −535 / −599 |
+
+6 人桌中兩個相同的 Agent 結果落在彼此的信賴區間內，符合預期。鏡像牌局在這些對戰中只讓變異數降低約 1.0～1.2 倍：Agent 風格差異很大時，同一副牌的結果相關性低；Agent 越接近，降幅越大（完全相同時變異為 0）。
+
