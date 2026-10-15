@@ -12,6 +12,7 @@ Tensors: reach / values (B, 1326); strategies and regrets (A, B, 1326).
 
 from __future__ import annotations
 
+import gc
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -389,9 +390,31 @@ class BatchedSubgameCFR:
                     continue
                 if self._graph is None:
                     self._graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(self._graph):
-                        self._one_iteration()  # recorded, not run
+                    # Garbage collection during capture could free another
+                    # solver's graph or tensors, which invalidates the capture.
+                    gc_was_enabled = gc.isenabled()
+                    gc.disable()
+                    try:
+                        with torch.cuda.graph(self._graph):
+                            self._one_iteration()  # recorded, not run
+                    finally:
+                        if gc_was_enabled:
+                            gc.enable()
                 self._graph.replay()
+
+    def release(self) -> None:
+        """Free the CUDA graph and all tensors now instead of waiting for the GC."""
+        if self._graph is not None and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self._graph = None
+
+        def drop(node: BNode) -> None:
+            node.regret = node.strat_sum = None
+            for c in node.children:
+                drop(c)
+
+        drop(self.root)
+        self.root = None
 
     def exploitability(self) -> dict[str, float]:
         with torch.no_grad():
@@ -424,6 +447,41 @@ class BatchedSubgameCFR:
 
         rec(self.root)
         return out
+
+    def node_table(self) -> list[dict[str, Any]]:
+        """Training rows for every first-street decision node, under the
+        average strategy: both players' reach at the node, the actor's action
+        probabilities, and each action's EV per combo in chips (expected value
+        given the actor holds that combo and the node is reached; NaN where no
+        opponent combo is compatible)."""
+        rows: list[dict[str, Any]] = []
+
+        def rec(node: BNode, reach: tuple[torch.Tensor, torch.Tensor]) -> None:
+            if node.kind != "decision":
+                return
+            p, o = node.player, 1 - node.player
+            sigma = self._avg(node)
+            vals = torch.stack([self._walk(child, p, reach[p] * sigma[k], reach[o], "ev", avg=True)
+                                for k, child in enumerate(node.children)])
+            mass = self._compatible(reach[o])
+            ev = torch.where(mass > 0, vals / mass.clamp_min(1e-30), torch.full_like(vals, float("nan")))
+            rows.append({
+                "path": node.path or "root",
+                "player": p,
+                "actions": list(node.actions),
+                "inv": node.inv,
+                "reach": (reach[0][0].double().cpu().numpy(), reach[1][0].double().cpu().numpy()),
+                "strategy": sigma[:, 0, :].double().cpu().numpy(),
+                "ev": ev[:, 0, :].double().cpu().numpy(),
+            })
+            for k, child in enumerate(node.children):
+                nxt = list(reach)
+                nxt[p] = reach[p] * sigma[k]
+                rec(child, (nxt[0], nxt[1]))
+
+        with torch.no_grad():
+            rec(self.root, self.ranges)
+        return rows
 
 
 class GpuSubgameSolver:

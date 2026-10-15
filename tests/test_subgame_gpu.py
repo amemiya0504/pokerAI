@@ -86,3 +86,26 @@ def test_cli_subgame(device, capsys):
                  "--pot", "10", "--stack", "100", "--bets", "river=100", "--raises",
                  "--max-raises", "0", "--no-allin", "--iterations", "50", "--device", device]) == 0
     assert "exploitability" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+def test_back_to_back_cuda_solves_with_garbage_collection():
+    # Regression: freeing an earlier solver's CUDA graph while the next one
+    # was being captured invalidated the capture (seen in long dataset builds).
+    import gc
+
+    board, cfg, oop, ip = SPOTS[1]
+    b = parse_cards(board)
+    ranges = (parse_range(oop, b), parse_range(ip, b))
+    leftovers = []
+    for k in range(6):
+        cfr = BatchedSubgameCFR(b, ranges, cfg, device="cuda")
+        cfr.iterate(6)
+        assert cfr.exploitability()["exploitability_pct_pot"] >= 0
+        if k % 2:
+            cfr.release()
+        else:
+            leftovers.append(cfr)  # left for the garbage collector
+        gc.collect()
+    leftovers.clear()
+    gc.collect()
