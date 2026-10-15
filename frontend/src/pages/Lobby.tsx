@@ -5,6 +5,8 @@ import { chips } from '../format'
 
 const OPPONENTS: { value: CreateGameRequest['opponents']; label: string }[] = [
   { value: 'mixed', label: '混合（隨機 + 跟注站）' },
+  { value: 'rule', label: '規則型（啟發式）' },
+  { value: 'pushfold', label: '求解器 push/fold（短籌碼 5～20 BB；其他情況改用規則型）' },
   { value: 'random', label: '隨機 Agent' },
   { value: 'station', label: '跟注站' },
 ]
@@ -88,7 +90,7 @@ export function Lobby() {
             </select>
           </label>
         </div>
-        <p className="text-xs opacity-60">目前的 AI 只有基準 Agent（隨機、跟注站），用於測試牌桌；策略型 AI 會在後續 Milestone 加入。</p>
+        <p className="text-xs opacity-60">求解器 AI 只在已求解的情況（短籌碼 push/fold）使用近似均衡策略，其餘情況改用規則型策略並標示為啟發式。</p>
         {error && <p className="text-sm text-red-400">{error}</p>}
         <button disabled={busy} className="w-full rounded-xl bg-amber-500 py-3 font-semibold text-slate-900 disabled:opacity-50" data-testid="create-submit">
           入座

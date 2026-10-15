@@ -9,7 +9,8 @@
 | M1 · 2～9 人 NLHE 引擎 | ✅ 完成（見下方驗收結果） |
 | M2 · 網頁牌桌 Human vs AI | ✅ 完成（見下方驗收結果） |
 | M3 · AI vs AI 大量模擬 | ✅ 完成（見下方驗收結果） |
-| M4～M10 | 未開始 |
+| M4 · 9-Max Preflop 策略 | ✅ 第一階段完成：短籌碼 push/fold（見下方）；深籌碼待翻後模型 |
+| M5～M10 | 未開始 |
 
 ## 快速開始
 
@@ -18,7 +19,7 @@
 ```bash
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
-pip install -e ".[web,sim,dev,oracle]"
+pip install -e ".[web,sim,solver,dev,oracle]"
 ```
 
 ### 網頁牌桌（M2）
@@ -50,6 +51,16 @@ python -m backend.arena rule random station --deals 20000 --seed 1 --out out/are
 
 Agent 寫成 `kind` 或 `name=kind`（kind：`rule`、`random`、`station`），同一種可用不同名字重複出現。每個 deal 會依座位輪換打 N 次（N = Agent 數），所以總手數 = deals × N。`--workers` 預設使用全部 CPU，`--boundary process` 讓每個 Agent 在獨立行程執行。
 
+### Preflop push/fold 求解（M4）
+
+已求解的資料放在 `data/preflop/pushfold/`。重新求解（約 2 小時，使用全部 CPU）：
+
+```bash
+python -m backend.solver pushfold --players 2-9 --stacks 5,8,10,12,15,20 --db sqlite:///poker.db
+```
+
+Arena 與網頁牌桌都能選用 `pushfold` Agent。
+
 ### CLI 示範
 
 隨機 Agent 對戰，輸出 JSON 手牌紀錄：
@@ -74,13 +85,16 @@ backend/
     base.py          # Agent 介面、Decision、StrategySource（五級）
     baseline.py      # RandomAgent、CallingStationAgent（僅供測試）
     rule_based.py    # RuleBasedAgent：Chen 公式 + 成手強度與底池賠率（HEURISTIC）
+    pushfold.py      # PushFoldAgent：已求解處用 SOLVER_APPROX，其餘退回規則型並標示 HEURISTIC
   arena/             # M3：鏡像牌局模擬、多進程、bb/100 統計、Parquet 與資料庫輸出
+  solver/            # M4：Solver 介面、169 手牌類別、push/fold MCCFR、單挑精確解、資料集存取
   db/                # SQLAlchemy 2 模型、Alembic 遷移、存取函式
   api/
     app.py           # FastAPI：REST（牌桌、歷史）+ 每張牌桌一條 WebSocket
     sessions.py      # GameSession：牌桌狀態、AI 行動迴圈、存檔、重啟後恢復
     views.py         # 送給瀏覽器的 JSON，只從 PlayerView 產生
   cli.py             # CLI 示範
+data/preflop/pushfold/  # 已求解的 push/fold 策略（附來源、授權、收斂指標）
 frontend/            # React + TypeScript + Vite + Tailwind
   src/pages/         # 大廳、牌桌、歷史牌局、逐步重播
   src/components/    # 牌桌、撲克牌、動作列、牌局紀錄
@@ -176,4 +190,37 @@ M2 的 AI 只有基準 Agent（隨機、跟注站），策略型 AI 從 M4 開�
 | 6 人 rule×2、random×2、station×2 | 120,000 | rule +516 / +507；station +66 / +45；random −535 / −599 |
 
 6 人桌中兩個相同的 Agent 結果落在彼此的信賴區間內，符合預期。鏡像牌局在這些對戰中只讓變異數降低約 1.0～1.2 倍：Agent 風格差異很大時，同一副牌的結果相關性低；Agent 越接近，降幅越大（完全相同時變異為 0）。
+
+## M4 驗收結果（第一階段：短籌碼 push/fold）
+
+**資料調查（2026-10-15）**：沒有找到授權明確、且由 Solver 產生的 9-max preflop 資料。[Rizehigh/gto-preflop-trainer](https://github.com/Rizehigh/gto-preflop-trainer) 雖為 MIT 授權，但未說明頻率來源；TexasSolver 內附的 6-max 範圍，維護者表示不清楚來源與求解設定（[Issue #11](https://github.com/bupticybee/TexasSolverGPU/issues/11)）；其餘多為商業產品。因此依設計文件第 10 節自行求解，不使用來源不明的資料。
+
+**求解的遊戲**：2～9 人、等效籌碼 5／8／10／12／15／20 BB、盲注 0.5/1、無 Ante。每位玩家只能棄牌或全下（面對全下時棄牌或跟注）。全下一律打到攤牌，所以報酬是精確的 chip EV，不需要翻後模型。共 48 組設定。
+
+**方法**：external-sampling MCCFR（線性加權），多進程同步批次。每位玩家只行動一次，所以平均策略就是各批當前策略的線性加權平均。
+
+**驗收：每筆策略都附來源與授權；沒有資料的地方標為近似，不假造**
+
+- **來源與授權**：每個資料檔都記錄 `strategy_source = solver_approx`、求解器名稱與設定、授權（本專案自行產生，不含第三方資料）、遊戲定義、request hash 與收斂指標。資料庫 `gto_datasets` 登記每個資料集，`solver_results` 以 request hash 快取完整結果（Alembic 遷移 0003）。
+- **收斂指標**：以兩半獨立樣本估計每位玩家偏離策略可多得的 EV，回報區間：上界（同一份樣本取最大值，雜訊會讓它偏高）與下界（一半選策略、另一半計分）。單挑全部落在 ±0.007 bb/hand 內；9 人桌單一位置最多約 0.06 bb/hand。
+- **不假造**：求解時很少走到的格子（例如已有多人跟注全下的分支）存成空值。9 人桌約 75% 的格子是這種罕見分支。
+- **Agent 標示**：`PushFoldAgent` 只在已求解的情境使用資料並標為 `SOLVER_APPROX`，附上動作機率。深籌碼、limp、非全下的加注、翻後，以及空值格子，一律退回規則型策略，標為 `HEURISTIC`，並寫明原因（例如「no solved data (effective stack 100.0bb outside solved depths)」）。
+- **獨立驗證**：單挑 10 BB 另以「類別對類別勝率矩陣 + 全寬度 CFR+」精確求解：SB 全下 58.2%、BB 跟注 37.3%，與已發表的單挑 push/fold Nash 結果相符。MCCFR 的策略用這個矩陣精確計算，可被剝削量只有 0.002 bb/hand。
+
+### 對戰結果（10 BB，鏡像牌局，95% 信賴區間）
+
+| 對戰 | 結果（bb/100） |
+|---|---|
+| 單挑 pushfold vs rule | pushfold +27.2 [26.3, 28.1] |
+| 單挑 pushfold vs random | pushfold +18.8 [15.7, 22.0] |
+| 單挑 pushfold vs station | pushfold +86.5 [83.1, 89.9] |
+| 9 人：pushfold×3、rule×3、station、random×2 | pushfold +21～+26；rule +11～+14；station −4；random −51～−54 |
+
+均衡策略的目的是不被剝削，而不是剝削對手，所以對隨機 Agent 的優勢小於對跟注站。
+
+### 限制與後續
+
+- 只涵蓋 5～20 BB 的 push/fold。深籌碼（例如 100 BB）的 preflop 需要翻後模型，計畫在 M5 的翻後 Solver 完成後再處理；在那之前，深籌碼一律標為 `HEURISTIC`。
+- 假設所有玩家籌碼相同；實際牌局取「我的籌碼與最大對手籌碼的較小值」，對應到最接近的已求解深度（相差超過 25% 就不使用）。
+- 無 Ante、chip EV（不含 ICM）。
 

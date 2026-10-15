@@ -1,5 +1,5 @@
-"""Database models (design doc section 6): Milestone 2 tables plus the
-Milestone 3 simulation tables.
+"""Database models (design doc section 6): Milestone 2 tables, Milestone 3
+simulation tables and Milestone 4 strategy datasets / solver cache.
 
 A hand's source of truth is (deck seed, button, blinds, starting stacks,
 action sequence); ``result`` and ``board`` are derived and kept for queries.
@@ -130,3 +130,34 @@ class BenchmarkResult(Base):
     ci_high: Mapped[float | None] = mapped_column()
 
     run: Mapped[SimulationRun] = relationship(back_populates="results")
+
+
+class GtoDataset(Base):
+    """A strategy dataset and where it came from (design doc section 6)."""
+
+    __tablename__ = "gto_datasets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(128))
+    version: Mapped[str] = mapped_column(String(32))
+    source: Mapped[str] = mapped_column(String(24))  # a StrategySource value
+    license: Mapped[str] = mapped_column(String(256))
+    row_count: Mapped[int] = mapped_column(Integer)
+    path: Mapped[str] = mapped_column(String(512))
+    details: Mapped[dict[str, Any]] = mapped_column(JSON)  # game, solver config, convergence
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class SolverResultRow(Base):
+    """Solver cache keyed by the request hash."""
+
+    __tablename__ = "solver_results"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    request_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON)
+    iterations: Mapped[int] = mapped_column(Integer)
+    exploitability: Mapped[float | None] = mapped_column()
+    result: Mapped[dict[str, Any]] = mapped_column(JSON)
+    source: Mapped[str] = mapped_column(String(24))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

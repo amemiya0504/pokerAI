@@ -19,10 +19,17 @@ from backend.engine.codec import (
 )
 from backend.engine.hand import PlayerView
 
+def _pushfold(seed: int, **kw):
+    from backend.agents.pushfold import PushFoldAgent  # loads datasets lazily
+
+    return PushFoldAgent(seed, **kw)
+
+
 REGISTRY: dict[str, Callable[..., Any]] = {
     "random": RandomAgent,
     "station": lambda seed, **kw: CallingStationAgent(),
     "rule": RuleBasedAgent,
+    "pushfold": _pushfold,
 }
 
 

@@ -9,7 +9,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from backend.agents import CallingStationAgent, RandomAgent
+from backend.agents import CallingStationAgent, RandomAgent, RuleBasedAgent
 from backend.db import Game
 from backend.db.repository import players_by_id, save_hand
 from backend.engine.actions import Action, ActionType, IllegalActionError
@@ -19,9 +19,17 @@ from backend.engine.table import Table
 
 from .views import legal_json, view_json
 
+def _pushfold(seed: int):
+    from backend.agents.pushfold import PushFoldAgent
+
+    return PushFoldAgent(seed)
+
+
 AGENTS: dict[str, Callable[[int], Any]] = {
     "random": lambda seed: RandomAgent(seed, all_in_weight=0.05),
     "station": lambda seed: CallingStationAgent(),
+    "rule": lambda seed: RuleBasedAgent(seed),
+    "pushfold": _pushfold,
 }
 
 
