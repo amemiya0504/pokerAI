@@ -1,0 +1,35 @@
+[project]
+name = "poker-ai"
+version = "0.1.0"
+description = "Poker AI research platform (virtual chips only)"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+web = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "websockets>=13",
+  "sqlalchemy>=2.0",
+  "alembic>=1.13",
+]
+dev = ["pytest>=8", "httpx>=0.27", "playwright>=1.45"]
+oracle = ["pokerkit>=0.7"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
+
+[tool.setuptools.package-data]
+"backend.db" = ["migrations/script.py.mako"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient`"]
+markers = [
+  "slow: long-running randomized tests",
+  "e2e: browser end-to-end tests (need built frontend + Playwright Chromium)",
+]

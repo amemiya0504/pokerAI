@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+@theme {
+  --color-felt: #0f5132;
+  --color-felt-edge: #3b2a1a;
+  --color-ink: #0b1f17;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink);
+  color: #e7efe9;
+  font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans TC", "PingFang TC", sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+input[type="range"] {
+  accent-color: #f5b301;
+}
