@@ -16,7 +16,7 @@ web = [
 sim = ["pyarrow>=17"]
 solver = ["numpy>=2.0"]
 dev = ["pytest>=8", "httpx>=0.27", "playwright>=1.45"]
-oracle = ["pokerkit>=0.7"]
+oracle = ["pokerkit>=0.7", "open_spiel>=1.5; sys_platform != 'win32'"]
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -10,7 +10,8 @@
 | M2 · 網頁牌桌 Human vs AI | ✅ 完成（見下方驗收結果） |
 | M3 · AI vs AI 大量模擬 | ✅ 完成（見下方驗收結果） |
 | M4 · 9-Max Preflop 策略 | ✅ 第一階段完成：短籌碼 push/fold（見下方）；深籌碼待翻後模型 |
-| M5～M10 | 未開始 |
+| M5 · Heads-Up Postflop Solver | ✅ 完成（見下方驗收結果） |
+| M6～M10 | 未開始 |
 
 ## 快速開始
 
@@ -61,6 +62,16 @@ python -m backend.solver pushfold --players 2-9 --stacks 5,8,10,12,15,20 --db sq
 
 Arena 與網頁牌桌都能選用 `pushfold` Agent。
 
+### Kuhn / Leduc 與單挑翻後子賽局（M5）
+
+```bash
+python -m backend.solver small leduc --iterations 3000
+python -m backend.solver subgame --board Ks7d4c2h --oop "22+,A2s+,K9s+,ATo+" --ip "22+,A2s+,K5s+,A9o+" \
+    --pot 10 --stack 40 --bets turn=50,100 river=50,100 --raises turn=100 river=100 --target 0.3
+```
+
+加上 `--db sqlite:///poker.db` 會以 request hash 快取結果，相同請求直接讀取。
+
 ### CLI 示範
 
 隨機 Agent 對戰，輸出 JSON 手牌紀錄：
@@ -87,7 +98,10 @@ backend/
     rule_based.py    # RuleBasedAgent：Chen 公式 + 成手強度與底池賠率（HEURISTIC）
     pushfold.py      # PushFoldAgent：已求解處用 SOLVER_APPROX，其餘退回規則型並標示 HEURISTIC
   arena/             # M3：鏡像牌局模擬、多進程、bb/100 統計、Parquet 與資料庫輸出
-  solver/            # M4：Solver 介面、169 手牌類別、push/fold MCCFR、單挑精確解、資料集存取
+  solver/            # Solver 介面與求解器
+                     #   M4：169 手牌類別、push/fold MCCFR、單挑精確解、資料集存取
+                     #   M5：games.py / cfr.py（Kuhn、Leduc、表格式 CFR+、精確 best response）
+                     #       subgame.py（單挑翻後子賽局：向量化 DCFR / CFR+）
   db/                # SQLAlchemy 2 模型、Alembic 遷移、存取函式
   api/
     app.py           # FastAPI：REST（牌桌、歷史）+ 每張牌桌一條 WebSocket
@@ -223,4 +237,41 @@ M2 的 AI 只有基準 Agent（隨機、跟注站），策略型 AI 從 M4 開�
 - 只涵蓋 5～20 BB 的 push/fold。深籌碼（例如 100 BB）的 preflop 需要翻後模型，計畫在 M5 的翻後 Solver 完成後再處理；在那之前，深籌碼一律標為 `HEURISTIC`。
 - 假設所有玩家籌碼相同；實際牌局取「我的籌碼與最大對手籌碼的較小值」，對應到最接近的已求解深度（相差超過 25% 就不使用）。
 - 無 Ante、chip EV（不含 ICM）。
+
+## M5 驗收結果
+
+**驗收：Kuhn / Leduc exploitability 收斂；單挑子賽局附收斂指標**
+
+### Kuhn 與 Leduc（表格式 CFR+，精確 exploitability）
+
+規則與動作編碼完全依照 OpenSpiel 的 `kuhn_poker`、`leduc_poker`。整棵賽局樹都列舉出來，所以 best response 與 NashConv 是精確值。只有 NashConv 低於門檻（預設 10⁻³）的結果才標為 `VERIFIED_EQUILIBRIUM`，否則標為 `SOLVER_APPROX`。
+
+| 遊戲 | 迭代 | NashConv | 先手期望值 | 已知值 | 標示 |
+|---|---|---|---|---|---|
+| Kuhn | 2,000 | 8.7×10⁻⁵ | −0.05556 | −1/18 | verified_equilibrium |
+| Leduc | 3,000 | 1.6×10⁻⁴ | −0.08561 | −0.0856 | verified_equilibrium |
+
+- **Kuhn 對照解析解**：先手用 J 詐唬的頻率 α 落在 [0, 1/3]，K 下注頻率 ≈ 3α，Q 從不下注，被下注時 Q 以 α + 1/3 跟注；後手 J 詐唬與 Q 跟注都是 1/3。
+- **與 OpenSpiel 交叉驗證**：每個節點的合法動作、輪到誰、終局報酬都和 OpenSpiel 一致；把我們的平均策略載入 OpenSpiel，它算出的 NashConv 與我們的值相差不到 10⁻⁹。OpenSpiel（Apache-2.0）只用在測試，不是執行時依賴。
+
+### 單挑翻後子賽局
+
+- **方法**：向量化 CFR：每個公開節點對全部 1,326 組底牌各存一列策略，遍歷時傳遞整個 reach 向量。預設 DCFR（α=1.5、β=0、γ=2），也可選 CFR+。
+- **精確的牌張移除**：終局只計算與自己底牌、公共牌都不衝突的對手組合；機會節點會發出每一張剩餘的牌。攤牌與棄牌的向量化計算，與逐組合暴力計算的結果完全一致。
+- **收斂指標**：以精確的向量 best response 計算 exploitability（佔底池百分比），並保存收斂歷程；可設定目標值，提早停止。
+- **理論對照**：河牌「極化範圍 vs 抓詐唬」玩具賽局，下注一個底池時，理論上詐唬佔下注範圍 1/3、跟注頻率 1/2、OOP 不主動下注。求解結果：詐唬比例 0.333、跟注 0.50、OOP 100% 過牌，exploitability 0.02% 底池。
+- **實際轉牌局面**（Ks7d4c2h，底池 10、籌碼 40，兩種下注尺寸加一種加注，2,990 個決策節點）：
+
+| 迭代 | DCFR（% 底池） | CFR+（% 底池） |
+|---|---|---|
+| 50 | 2.23 | 4.13 |
+| 100 | 0.62 | 1.39 |
+| 150 | 0.31 | 0.74 |
+| 200 | 0.18 | 0.48 |
+
+### 限制與後續
+
+- 速度：純 NumPy，上面的轉牌局面每次迭代約 1 秒；翻牌局面樹很大（要展開所有轉牌與河牌），記憶體與時間都高，目前只適合小範圍、少尺寸。向量化 CFR 很適合移到 GPU（例如 PyTorch），M6 大量產生資料前可以考慮。
+- 固定下注尺寸的抽象樹，結果標為 `SOLVER_APPROX`；對手使用樹外的尺寸時，需要 action translation（設計文件第 10 節），留待接上 Agent 時實作。
+- TexasSolver（AGPL）的 CLI 對照尚未接上；目前以解析解、OpenSpiel 與暴力計算驗證。
 
