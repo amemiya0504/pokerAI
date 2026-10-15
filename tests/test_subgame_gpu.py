@@ -76,3 +76,13 @@ def test_gpu_solver_result_shape():
     c = facing["actions"].index("c")
     calls = [v[c] for v in facing["combos"].values()]
     assert sum(calls) / len(calls) == pytest.approx(0.5, abs=0.03)
+
+
+@pytest.mark.parametrize("device", ["cpu", "numpy"])
+def test_cli_subgame(device, capsys):
+    from backend.solver.__main__ import main
+
+    assert main(["subgame", "--board", "Ks7d4c2h9s", "--oop", "QQ,JJ", "--ip", "77,44,J8s,T8s",
+                 "--pot", "10", "--stack", "100", "--bets", "river=100", "--raises",
+                 "--max-raises", "0", "--no-allin", "--iterations", "50", "--device", device]) == 0
+    assert "exploitability" in capsys.readouterr().out

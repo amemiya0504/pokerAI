@@ -177,9 +177,6 @@ def _cache(db_url: str, result) -> None:
         db.commit()
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
 
 class _WithOptions:
     """Pass run-only options (device, memory limit) without changing the request hash."""
@@ -194,3 +191,6 @@ class _WithOptions:
         res.request = req
         return res
 
+
+if __name__ == "__main__":
+    sys.exit(main())
