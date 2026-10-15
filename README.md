@@ -72,6 +72,12 @@ python -m backend.solver subgame --board Ks7d4c2h --oop "22+,A2s+,K9s+,ATo+" --i
 
 加上 `--db sqlite:///poker.db` 會以 request hash 快取結果，相同請求直接讀取。
 
+子賽局預設使用批次化的 PyTorch 版本（有 CUDA 就用 GPU），`--device numpy` 改用 NumPy 參考實作。安裝 GPU 版 PyTorch：
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
+
 ### CLI 示範
 
 隨機 Agent 對戰，輸出 JSON 手牌紀錄：
@@ -101,7 +107,8 @@ backend/
   solver/            # Solver 介面與求解器
                      #   M4：169 手牌類別、push/fold MCCFR、單挑精確解、資料集存取
                      #   M5：games.py / cfr.py（Kuhn、Leduc、表格式 CFR+、精確 best response）
-                     #       subgame.py（單挑翻後子賽局：向量化 DCFR / CFR+）
+                     #       subgame.py（單挑翻後子賽局：向量化 DCFR / CFR+，NumPy 參考實作）
+                     #       subgame_gpu.py（同一演算法的批次化 PyTorch 版本，CUDA Graph）
   db/                # SQLAlchemy 2 模型、Alembic 遷移、存取函式
   api/
     app.py           # FastAPI：REST（牌桌、歷史）+ 每張牌桌一條 WebSocket
@@ -269,9 +276,29 @@ M2 的 AI 只有基準 Agent（隨機、跟注站），策略型 AI 從 M4 開�
 | 150 | 0.31 | 0.74 |
 | 200 | 0.18 | 0.48 |
 
+### GPU 加速
+
+同一條下注路線之後的子樹，對每一張可能發出的轉牌或河牌結構都相同，所以把它們合併成一個「模板節點」，張量多一個 board 維度（每列一個公共牌面）。上面的轉牌局面從 2,990 個節點變成 76 個模板；整個迭代再用 CUDA Graph 錄下來重播，省掉數千次 kernel 啟動。
+
+| 實作（Ks7d4c2h 轉牌局面） | 每次迭代 |
+|---|---|
+| NumPy 參考實作 | 約 1,200 ms |
+| 批次化 PyTorch（CPU） | 約 340 ms |
+| 批次化 PyTorch（RTX 4060 Laptop，逐個啟動 kernel） | 約 230 ms |
+| 批次化 PyTorch（RTX 4060 Laptop，CUDA Graph） | **約 19 ms** |
+
+- **正確性**：批次版本以 float64 在 CPU 執行時，DCFR 的 exploitability 與策略和 NumPy 參考實作一致到 10⁻⁹；CUDA Graph 與逐個啟動的結果一致到 float32 精度。CFR+ 會把 regret 截在 0，10⁻¹³ 的加總順序差異可能讓某手牌在「0」與「極小正值」之間切換，所以 CFR+ 的比對容許較大誤差。
+- **翻牌局面**（Ks7d4c，底池 10、籌碼 90；NumPy 版本在這個規模不實用）：
+
+  | 下注樹 | 模板 | regret＋策略 | GPU 峰值 | 每次迭代 | 100 次迭代 |
+  |---|---|---|---|---|---|
+  | 每條街一種尺寸、不加注 | 78 | 3.2 GB | 4.5 GB | 1.2 秒 | 0.64% 底池 |
+  | 每條街一種尺寸＋一次加注 | 134 | 5.5 GB | 7.4 GB | 2.1 秒 | 1.47% 底池 |
+- **記憶體上限**：建樹時先估算 regret 與策略需要的記憶體，超過上限（預設 6 GB）就拒絕並說明，而不是在 GPU 上耗盡記憶體。
+
 ### 限制與後續
 
-- 速度：純 NumPy，上面的轉牌局面每次迭代約 1 秒；翻牌局面樹很大（要展開所有轉牌與河牌），記憶體與時間都高，目前只適合小範圍、少尺寸。向量化 CFR 很適合移到 GPU（例如 PyTorch），M6 大量產生資料前可以考慮。
+- 翻牌局面的記憶體隨下注尺寸與加注次數快速成長；多尺寸的翻牌樹需要更大的 GPU，或花色同構、半精度儲存等減量手段。
 - 固定下注尺寸的抽象樹，結果標為 `SOLVER_APPROX`；對手使用樹外的尺寸時，需要 action translation（設計文件第 10 節），留待接上 Agent 時實作。
 - TexasSolver（AGPL）的 CLI 對照尚未接上；目前以解析解、OpenSpiel 與暴力計算驗證。
 

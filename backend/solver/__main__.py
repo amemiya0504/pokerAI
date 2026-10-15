@@ -62,6 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     sg.add_argument("--iterations", type=int, default=300)
     sg.add_argument("--target", type=float, default=0.5, help="stop at this exploitability (%% pot)")
     sg.add_argument("--variant", choices=["dcfr", "cfr+"], default="dcfr")
+    sg.add_argument("--device", default="auto",
+                    help="auto (CUDA if available), cuda, cpu (batched PyTorch) or numpy (reference)")
+    sg.add_argument("--memory-limit-gb", type=float, default=6.0)
     sg.add_argument("--out", help="write the result JSON here")
     for p in (sm, sg):
         p.add_argument("--db", help="cache results by request hash in this database")
@@ -118,7 +121,15 @@ def _solve_one(args) -> int:
             "raise_sizes": _sizes(args.raises), "max_raises": args.max_raises,
             "allin": not args.no_allin,
         }, {"iterations": args.iterations, "target_pct_pot": args.target, "variant": args.variant})
-        solver = SubgameSolver()
+        if args.device == "numpy":
+            solver = SubgameSolver()
+        else:
+            from .subgame_gpu import GpuSubgameSolver, default_device
+
+            device = default_device() if args.device == "auto" else args.device
+            # The device does not change the answer, so it stays out of the request hash.
+            solver = _WithOptions(GpuSubgameSolver(), device=device,
+                                  memory_limit_gb=args.memory_limit_gb)
 
     result = None
     if args.db:
@@ -168,3 +179,18 @@ def _cache(db_url: str, result) -> None:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+class _WithOptions:
+    """Pass run-only options (device, memory limit) without changing the request hash."""
+
+    def __init__(self, solver, **options) -> None:
+        self.solver, self.options = solver, options
+
+    def solve(self, req):
+        from dataclasses import replace
+
+        res = self.solver.solve(replace(req, solver={**req.solver, **self.options}))
+        res.request = req
+        return res
+
