@@ -33,9 +33,11 @@ class PolicyNet(nn.Module):
                 reach_actor: torch.Tensor, reach_opp: torch.Tensor) -> torch.Tensor:
         """Logits with illegal actions at -inf. Shapes: hole/board (B, 52),
         category (B, 9), scalars (B, 3), node (B, N_NODE), legal (B, A) bool,
-        reaches (B, 1326) normalised."""
-        x = torch.cat([hole, board, category, scalars, node, legal.float(),
-                       torch.relu(self.range_actor(reach_actor)),
-                       torch.relu(self.range_opp(reach_opp))], dim=1)
+        reaches (B, 1326) normalised, or (1, 1326) when every row shares the
+        same node (inference): embedded once, then broadcast."""
+        n = hole.shape[0]
+        ea = torch.relu(self.range_actor(reach_actor)).expand(n, -1)
+        eo = torch.relu(self.range_opp(reach_opp)).expand(n, -1)
+        x = torch.cat([hole, board, category, scalars, node, legal.float(), ea, eo], dim=1)
         logits = self.head(self.body(x))
         return logits.masked_fill(~legal, float("-inf"))

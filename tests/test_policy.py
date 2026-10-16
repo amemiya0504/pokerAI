@@ -120,3 +120,35 @@ def test_vocabulary_covers_dataset_trees():
         labels |= {f"b{round(f * 100)}" for v in t.bet_sizes.values() for f in v}
         labels |= {f"r{round(f * 100)}" for v in t.raise_sizes.values() for f in v}
     assert labels <= set(VOCAB)
+
+
+def test_exploitability_tool_reproduces_the_solver_and_measures_a_policy():
+    """Writing the solver's own strategy back through ``install`` must give the
+    solver's exploitability; a uniform policy must be far more exploitable."""
+    from backend.dataset.spots import DEFAULT_TREES, make_spot, tree_config
+    from backend.engine.cards import parse_cards
+    from backend.policy.exploit import evaluate_spot, install
+    from backend.solver.subgame_gpu import BatchedSubgameCFR
+
+    spot = make_spot(3, 0, {"river": 1.0})
+    ref = BatchedSubgameCFR(parse_cards(spot.board), spot.ranges(), tree_config(spot, DEFAULT_TREES),
+                            device="cpu", dtype=torch.float64)
+    ref.iterate(100)
+    solved = ref.exploitability()["exploitability_pct_pot"]
+    avg = {}
+
+    def collect(node):
+        if node.kind == "decision":
+            avg[node.path or "root"] = ref._avg(node)[:, 0, :].numpy()
+            for c in node.children:
+                collect(c)
+
+    collect(ref.root)
+    install(ref, spot, lambda ctx: avg[ctx["path"]][:, ctx["combos"]])
+    assert ref.exploitability()["exploitability_pct_pot"] == pytest.approx(solved, rel=1e-6)
+
+    uniform = evaluate_spot(spot, lambda ctx: np.full((len(ctx["actions"]), len(ctx["combos"])),
+                                                      1 / len(ctx["actions"])),
+                            device="cpu", dtype=torch.float64, max_iterations=100)
+    assert uniform.solver_pct_pot <= 0.5 + 1e-9 or uniform.solver_pct_pot < uniform.policy_pct_pot
+    assert uniform.policy_pct_pot > 5 * uniform.solver_pct_pot

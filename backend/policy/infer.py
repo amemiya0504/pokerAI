@@ -68,8 +68,8 @@ class PolicyRunner:
                                   dtype=torch.float32, device=dev)
         num = torch.as_tensor(node_numeric(street, player, pot, stack, inv, hist), device=dev)[None].expand(n, -1)
         legal = torch.as_tensor(legal_mask(actions), device=dev)[None].expand(n, -1)
-        ra = torch.as_tensor(normalise(reach[player]), device=dev)[None].expand(n, -1)
-        ro = torch.as_tensor(normalise(opp), device=dev)[None].expand(n, -1)
+        ra = torch.as_tensor(normalise(reach[player]), device=dev)[None]  # one row: embedded once
+        ro = torch.as_tensor(normalise(opp), device=dev)[None]
         probs = torch.softmax(self.model(hole, board_multi.expand(n, -1), cat, scalars, num, legal, ra, ro), dim=1)
         return probs[:, action_slots(actions)].cpu().numpy()
 
