@@ -1,5 +1,6 @@
 """Database models (design doc section 6): Milestone 2 tables, Milestone 3
-simulation tables and Milestone 4 strategy datasets / solver cache.
+simulation tables, Milestone 4 strategy datasets / solver cache and
+Milestone 7 model versions / training runs.
 
 A hand's source of truth is (deck seed, button, blinds, starting stacks,
 action sequence); ``result`` and ``board`` are derived and kept for queries.
@@ -161,3 +162,31 @@ class SolverResultRow(Base):
     result: Mapped[dict[str, Any]] = mapped_column(JSON)
     source: Mapped[str] = mapped_column(String(24))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ModelVersion(Base):
+    """A trained policy network (design doc section 6)."""
+
+    __tablename__ = "model_versions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    arch: Mapped[dict[str, Any]] = mapped_column(JSON)
+    checkpoint_path: Mapped[str] = mapped_column(String(512))
+    dataset_ids: Mapped[list[Any]] = mapped_column(JSON)  # gto_datasets ids or dataset names
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON)  # test metrics, baselines, targets
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    runs: Mapped[list[TrainingRun]] = relationship(back_populates="model_version")
+
+
+class TrainingRun(Base):
+    __tablename__ = "training_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    model_version_id: Mapped[int] = mapped_column(ForeignKey("model_versions.id"), index=True)
+    config: Mapped[dict[str, Any]] = mapped_column(JSON)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON)  # per-epoch history, device, versions
+    resumed_from: Mapped[int | None] = mapped_column(Integer)  # epoch resumed from, if any
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    model_version: Mapped[ModelVersion] = relationship(back_populates="runs")

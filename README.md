@@ -12,7 +12,8 @@
 | M4 · 9-Max Preflop 策略 | ✅ 第一階段完成：短籌碼 push/fold（見下方）；深籌碼待翻後模型 |
 | M5 · Heads-Up Postflop Solver | ✅ 完成（見下方驗收結果） |
 | M6 · GTO Dataset Pipeline | ✅ 完成（見下方驗收結果） |
-| M7～M10 | 未開始 |
+| M7 · GTO Policy Network | ✅ 完成（見下方驗收結果） |
+| M8～M10 | 未開始 |
 
 ## 快速開始
 
@@ -88,6 +89,16 @@ python -m backend.dataset validate out/datasets/gto-postflop-hu-v1 --db sqlite:/
 
 `build` 中斷後重新執行同一行指令，只會補算缺少的分片；`validate` 全部通過才會登記到資料庫。
 
+### GTO Policy Network（M7）
+
+```bash
+python -m backend.policy prepare out/datasets/gto-postflop-hu-v1 out/datasets/gto-postflop-hu-v2 --out out/policy/v1v2-features.npz
+python -m backend.policy train out/policy/v1v2-features.npz out/policy/run-v1v2 --hidden 512 --dropout 0.3 --db sqlite:///poker.db
+python -m backend.policy benchmark out/policy/run-v1v2/model.pt
+```
+
+`train` 中斷後用同一行指令會從 `checkpoint.pt` 續訓（設定不同會拒絕）。
+
 ### CLI 示範
 
 隨機 Agent 對戰，輸出 JSON 手牌紀錄：
@@ -103,6 +114,7 @@ backend/
   engine/            # 純 Python、零外部依賴，唯一的規則來源
     cards.py         # 0～51 整數牌、Deck（固定種子洗牌）、derive_seed
     evaluator.py     # 5～7 張牌直接評估，回傳可比較的整數分數
+    fast_eval.py     # NumPy 向量化評估（與 evaluator 分數相同）、對範圍的精確勝率
     actions.py       # ActionType、Action、LegalActions、IllegalActionError
     hand.py          # HandState 單手牌狀態機、PlayerView、HandResult
     table.py         # Table：座位、入座/離桌/暫離、按鈕移動、開新局
@@ -120,6 +132,7 @@ backend/
                      #       subgame.py（單挑翻後子賽局：向量化 DCFR / CFR+，NumPy 參考實作）
                      #       subgame_gpu.py（同一演算法的批次化 PyTorch 版本，CUDA Graph）
   dataset/           # M6：題目產生、求解並抽出訓練資料、分片寫入與續跑、驗證
+  policy/            # M7：特徵（訓練與推論共用）、PolicyNet、資料準備、訓練與續訓、推論
   db/                # SQLAlchemy 2 模型、Alembic 遷移、存取函式
   api/
     app.py           # FastAPI：REST（牌桌、歷史）+ 每張牌桌一條 WebSocket
@@ -350,6 +363,8 @@ M2 的 AI 只有基準 Agent（隨機、跟注站），策略型 AI 從 M4 開�
 | 收斂 | 全部 ≤ 0.5% 底池；中位數河牌 0.22%、轉牌 0.28% |
 | 驗證 | 全部通過，已登記到資料庫 |
 
+之後為 M7 另外產生 **V2**（種子 2）：4,000 題、47,058 列、633 MB，全部 ≤ 0.5% 底池並通過驗證。
+
 資料集放在 `out/datasets/`（不進 git，可用指令重建）。在 GPU 上重建時，`index_add` 使用原子運算，結果可能在最後幾位小數不同；CPU 上可逐位元重現。
 
 **建置中遇到的問題**：第一次建置在約第 75 題時，CUDA Graph 錄製失敗（`cudaErrorStreamCaptureInvalidated`）。原因是錄製途中 Python 的垃圾回收釋放了上一題的 CUDA Graph 與張量。修正方式：錄製期間暫停垃圾回收，並在每題抽完資料後明確釋放求解器。修正後續跑的 950 題沒有再出錯，並加入回歸測試。
@@ -359,4 +374,75 @@ M2 的 AI 只有基準 Agent（隨機、跟注站），策略型 AI 從 M4 開�
 - **範圍是合成的**：雙方範圍是「依 Chen 公式取前 X%」再加少量隨機權重，不是從翻前均衡推導而來；manifest 已註明。等深籌碼翻前策略完成後，可以改用真正的到達範圍。
 - **只有轉牌與河牌**：翻牌題目的記憶體與時間成本高，V1 未納入。
 - **只抽第一條街的節點**：轉牌題目中河牌的節點沒有抽出。
+
+## M7 驗收結果
+
+**驗收：驗證集 KL 與 EV regret 達標；CPU 單次推論 < 100 ms**
+
+設計文件沒有寫具體門檻，所以在**訓練之前**先訂好目標，之後沒有再調整：
+
+| 指標 | 目標 | 結果（測試集 500 題） |
+|---|---|---|
+| KL（solver 策略 ‖ 模型策略），依到達機率加權 | ≤ 0.15 nats | **0.093** ✅ |
+| EV regret：Σ (solver − 模型) × 動作 EV，佔底池 | ≤ 1% | **0.19%** ✅ |
+| CPU 單次決策（含特徵計算，全新牌面） | < 100 ms | **p95 約 73 ms、最大 78～85 ms** ✅ |
+
+### 模型與資料
+
+- **輸入**：手牌與公共牌、牌型類別、牌力百分位、對對手範圍的精確勝率（轉牌對每張河牌平均，含牌張移除）、底池幾何（面對下注與否、跟注額、SPR、雙方投入）、合法動作遮罩、雙方範圍（各一層線性嵌入），以及「範圍對範圍」勝率直方圖（雙方各 10 格，描述範圍優勢與堅果優勢）。
+- **輸出**：固定 10 個動作欄位（f、x、c、b33、b50、b75、b100、b150、r100、a），不合法的遮掉。
+- **網路**：MLP（3 層 × 512、dropout 0.3），參數約 85 萬。
+- **損失**：對 solver 混合策略的交叉熵，依「帶著這手牌到達這個節點的機率」加權。
+- **資料**：V1＋V2 共 5,000 題、59,050 個節點、約 2,450 萬筆（節點 × 底牌組合）。**依題目切分**：10% 測試（只在最後評估）、10% 驗證（選最佳 epoch）、80% 訓練，同一題不會出現在兩個集合。
+- **訓練**：RTX 4060 Laptop 約 5 分鐘（12 個 epoch）；驗證 KL 到最後一個 epoch 仍在下降，沒有過擬合。
+
+### 結果細節（測試集）
+
+| | KL | EV regret |
+|---|---|---|
+| **模型** | **0.093** | **0.19%** |
+| 同類節點平均策略（基準） | 0.531 | 7.60% |
+| 合法動作均勻隨機（基準） | 0.868 | 10.43% |
+
+| 節點類型 | KL | EV regret |
+|---|---|---|
+| 河牌、不面對下注 | 0.083 | 0.14% |
+| 河牌、面對下注 | 0.044 | 0.13% |
+| 轉牌、不面對下注 | 0.143 | 0.22% |
+| 轉牌、面對下注 | 0.128 | 0.49% |
+
+**標籤雜訊下限**：同一題用兩種演算法（DCFR、CFR+）各自求解到 ≤ 0.5% 底池，兩者策略的 KL 約 0.03 nats。接近無差異的手牌，混合比例本來就不唯一，所以 KL 不可能降到 0。
+
+### 達標的過程（全部數字都是測試集）
+
+| 改動 | 資料 | KL | EV regret |
+|---|---|---|---|
+| 基本 MLP，以驗證集選 epoch | V1 | 0.292 | 1.10% |
+| 加寬＋dropout 0.3 | V1 | 0.249 | 0.65% |
+| ＋轉牌精確勝率 | V1 | 0.231 | 0.52% |
+| ＋範圍對範圍勝率直方圖 | V1 | 0.197 | 0.42% |
+| 同上，加入 V2（資料 5 倍） | V1＋V2 | **0.093** | **0.19%** |
+
+只用 V1（900 題訓練）時明顯過擬合，所以產生 V2；轉牌勝率與範圍直方圖則來自錯誤分析（轉牌、面對下注的節點最差；不面對下注時選擇下注尺寸主要取決於範圍形狀）。
+
+### 推論速度
+
+為了讓轉牌也能用精確勝率，新增 `fast_eval.py`：NumPy 向量化的 5～7 張牌評估（約每秒 100 萬手，分數與原評估器逐一相同），以及對範圍的精確勝率（與逐手暴力計算相差 10⁻¹⁴）。轉牌的牌面前處理（48 張河牌 × 1,081 組合）用兩個執行緒，約 20 ms。
+
+| 情境（CPU） | p95 |
+|---|---|
+| 河牌，全新牌面 | 約 6 ms |
+| 轉牌，全新牌面 | 約 73 ms |
+| 同一牌面上的後續決策 | 約 7～23 ms |
+
+### 可重現與續訓
+
+- 固定種子、deterministic 演算法、每個 epoch 的洗牌由（種子, epoch）決定；測試確認「訓練 1 個 epoch → 中斷 → 續訓」與一次訓練完的權重逐位元相同（CPU）。
+- 每次訓練記錄設定、每個 epoch 的指標、PyTorch／CUDA 版本與 GPU；資料庫 `model_versions`、`training_runs`（Alembic 遷移 0004）登記模型與訓練紀錄。
+
+### 限制
+
+- **只學到 solver 在這些題目上的策略**：題目的範圍是合成的（見 M6），下注抽象固定；評估的是「模仿 solver」的程度，不代表對真人或其他尺寸的表現。標示為 `NEURAL_APPROX`。
+- **EV regret 用 solver 的動作 EV**：假設之後的節點照 solver 打；模型在後續節點也偏離時的整體損失，需要接上 Agent 後在 Arena 實測。
+- **還沒有接成 Agent**：實際牌局中需要估計雙方的範圍（M8 對手建模的一部分）。
 

@@ -143,7 +143,8 @@ class Showdown:
                 lo[i] = np.searchsorted(row, s, side="left")
                 hi[i] = np.searchsorted(row, s, side="right")
 
-    def net_mass(self, r_opp: np.ndarray) -> np.ndarray:
+    def masses(self, r_opp: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(weaker, stronger): compatible opponent reach that loses to / beats each combo."""
         rp = self._rp
         rp[:N] = r_opp
         cum = self._cum
@@ -154,7 +155,19 @@ class Showdown:
         weaker = cum[self.lo] - cumc[CARD_A, self.lo_a] - cumc[CARD_B, self.lo_b]
         stronger = ((total - cum[self.hi]) - (ctot[CARD_A] - cumc[CARD_A, self.hi_a])
                     - (ctot[CARD_B] - cumc[CARD_B, self.hi_b]))
-        return np.where(self.valid, weaker - stronger, 0.0)
+        return np.where(self.valid, weaker, 0.0), np.where(self.valid, stronger, 0.0)
+
+    def net_mass(self, r_opp: np.ndarray) -> np.ndarray:
+        weaker, stronger = self.masses(r_opp)
+        return weaker - stronger
+
+    def equity(self, r_opp: np.ndarray) -> np.ndarray:
+        """Showdown equity of each combo against the opponent's range (ties count half);
+        0 where no opponent combo is compatible."""
+        weaker, stronger = self.masses(r_opp)
+        compat = compatible_mass(r_opp)
+        ties = np.maximum(compat - weaker - stronger, 0.0)
+        return np.where((compat > 0) & self.valid, (weaker + 0.5 * ties) / np.maximum(compat, 1e-30), 0.0)
 
 
 def compatible_mass(r_opp: np.ndarray) -> np.ndarray:
