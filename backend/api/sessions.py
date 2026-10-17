@@ -25,7 +25,14 @@ def _pushfold(seed: int):
     return PushFoldAgent(seed)
 
 
+def _realtime(seed: int):
+    from backend.agents.realtime import RealtimeAgent
+
+    return RealtimeAgent(seed)
+
+
 AGENTS: dict[str, Callable[[int], Any]] = {
+    "realtime": _realtime,
     "random": lambda seed: RandomAgent(seed, all_in_weight=0.05),
     "station": lambda seed: CallingStationAgent(),
     "rule": lambda seed: RuleBasedAgent(seed),
@@ -235,7 +242,8 @@ class GameSession:
                     return
                 seat = state.to_act
                 legal = state.legal_actions()
-                decision = self._agents[seat].act(state.observation(seat), legal)
+                # Off the event loop: a real-time solving AI may think for seconds.
+                decision = await asyncio.to_thread(self._agents[seat].act, state.observation(seat), legal)
                 state.apply(decision.action)
                 self._decisions.append({
                     "strategy_source": str(decision.strategy_source),

@@ -6,6 +6,7 @@ import { chips } from '../format'
 const OPPONENTS: { value: CreateGameRequest['opponents']; label: string }[] = [
   { value: 'mixed', label: '混合（隨機 + 跟注站）' },
   { value: 'rule', label: '規則型（啟發式）' },
+  { value: 'realtime', label: '即時求解（單挑；轉牌與河牌每步最多思考 10 秒）' },
   { value: 'pushfold', label: '求解器 push/fold（短籌碼 5～20 BB；其他情況改用規則型）' },
   { value: 'random', label: '隨機 Agent' },
   { value: 'station', label: '跟注站' },

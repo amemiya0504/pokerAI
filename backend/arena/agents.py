@@ -25,7 +25,21 @@ def _pushfold(seed: int, **kw):
     return PushFoldAgent(seed, **kw)
 
 
+def _realtime(seed: int, **kw):
+    from backend.agents.realtime import RealtimeAgent
+
+    return RealtimeAgent(seed, **kw)
+
+
+def _neural(seed: int, **kw):
+    from backend.agents.realtime import RealtimeAgent
+
+    return RealtimeAgent(seed, mode="network", **kw)
+
+
 REGISTRY: dict[str, Callable[..., Any]] = {
+    "realtime": _realtime,
+    "neural": _neural,
     "random": RandomAgent,
     "station": lambda seed, **kw: CallingStationAgent(),
     "rule": RuleBasedAgent,

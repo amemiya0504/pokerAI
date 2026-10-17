@@ -22,7 +22,6 @@ import torch
 
 from backend.agents.base import StrategySource
 from backend.engine.cards import parse_cards
-from backend.engine.evaluator import evaluate
 
 from .base import SolveRequest, SolveResult
 from .subgame import (
@@ -143,11 +142,32 @@ class ShowdownBatch:
 
 
 def _strengths(board: tuple[int, ...]) -> np.ndarray:
-    m = board_mask(board)
+    from backend.engine.fast_eval import evaluate_many
+
+    idx = np.nonzero(board_mask(board))[0]
     out = np.full(N, -1, dtype=np.int64)
-    for i in np.nonzero(m)[0]:
-        out[i] = evaluate((int(CARD_A[i]), int(CARD_B[i]), *board))
+    hands = np.concatenate([CARD_A[idx, None], CARD_B[idx, None],
+                            np.tile(np.array(board, dtype=np.int64), (len(idx), 1))], axis=1)
+    out[idx] = evaluate_many(hands)  # same scores as evaluator.evaluate, vectorised
     return out
+
+
+@dataclass(frozen=True)
+class RootState:
+    """Where the subgame starts inside the current street (the subgame always
+    begins at the start of a street; this replays what happened since).
+
+    ``bet``: chips each player has put in on this street (OOP, IP);
+    ``player``: who acts at the root (0 = OOP, 1 = IP); ``raises``: raises so
+    far this street; ``checked``: OOP checked and IP is to act;
+    ``extra_sizes``: additional pot fractions offered at the root only (to
+    include an observed off-tree bet size)."""
+
+    bet: tuple[float, float] = (0.0, 0.0)
+    player: int = 0
+    raises: int = 0
+    checked: bool = False
+    extra_sizes: tuple[float, ...] = ()
 
 
 class BatchedBuilder:
@@ -161,8 +181,13 @@ class BatchedBuilder:
         self._showdowns: dict[bytes, ShowdownBatch] = {}
         self._chances: dict[bytes, tuple] = {}
 
-    def build(self, board: tuple[int, ...]) -> BNode:
-        return self._street(np.array([board], dtype=np.int64), (0.0, 0.0), "")
+    def build(self, board: tuple[int, ...], root: RootState | None = None) -> BNode:
+        boards = np.array([board], dtype=np.int64)
+        if root is None:
+            return self._street(boards, (0.0, 0.0), "")
+        self._root_extra = tuple(root.extra_sizes)
+        return self._decide(boards, tuple(root.bet), root.player, tuple(root.bet), root.raises, "",
+                            checked=root.checked)
 
     def _street(self, boards, inv, path) -> BNode:
         return self._decide(boards, inv, 0, (0.0, 0.0), 0, path + ("/" if path else ""))
@@ -200,30 +225,25 @@ class BatchedBuilder:
         node.children = [child]
         return node
 
-    def _decide(self, boards, inv, p, bet, raises, path, checked=False) -> BNode:
+    def options(self, street: str, inv, p: int, bet, raises: int, checked: bool,
+                root: bool = False) -> list[tuple[str, float]]:
+        """Actions at a decision node and the chips each puts in (fold/check: 0)."""
         cfg = self.cfg
         o = 1 - p
-        node = BNode("decision", inv, boards, player=p, path=path)
-        self.template_nodes += 1
-        street = STREETS[boards.shape[1]]
         pot_now = cfg.pot + inv[0] + inv[1]
         remaining = cfg.stack - inv[p]
         to_call = bet[o] - bet[p]
-        opts: list[tuple[str, BNode]] = []
+        opts: list[tuple[str, float]] = []
         if to_call > 0:
-            opts.append(("f", BNode("fold", inv, boards, folder=p, path=path + "f")))
-            call_inv = (inv[0] + (to_call if p == 0 else 0), inv[1] + (to_call if p == 1 else 0))
-            allin = cfg.stack - call_inv[o] <= 1e-9 or cfg.stack - call_inv[p] <= 1e-9
-            opts.append(("c", self._next(boards, call_inv, path + "c", allin)))
+            opts += [("f", 0.0), ("c", to_call)]
             sizes = cfg.raise_sizes.get(street, []) if raises < cfg.max_raises else []
             base = pot_now + to_call
         else:
-            if checked:
-                opts.append(("x", self._next(boards, inv, path + "x", False)))
-            else:
-                opts.append(("x", self._decide(boards, inv, o, bet, raises, path + "x", checked=True)))
+            opts.append(("x", 0.0))
             sizes = cfg.bet_sizes.get(street, [])
             base = pot_now
+        if root and getattr(self, "_root_extra", ()):
+            sizes = sorted(set(sizes) | set(self._root_extra))
         can_raise = remaining > to_call + 1e-9 and (to_call == 0 or raises < cfg.max_raises)
         if can_raise and cfg.stack - inv[o] > 1e-9:
             amounts = []
@@ -236,17 +256,43 @@ class BatchedBuilder:
                 amounts.append(("a", remaining))
             seen = set()
             for label, add in amounts:
-                key = round(add, 6)
-                if key in seen:
-                    continue
-                seen.add(key)
+                if round(add, 6) not in seen:
+                    seen.add(round(add, 6))
+                    opts.append((label, add))
+        return opts
+
+    def root_options(self, board, root: RootState) -> list[tuple[str, float]]:
+        """The root's actions without building the tree below it."""
+        self._root_extra = tuple(root.extra_sizes)
+        return self.options(STREETS[len(board)], tuple(root.bet), root.player, tuple(root.bet),
+                            root.raises, root.checked, root=True)
+
+    def _decide(self, boards, inv, p, bet, raises, path, checked=False) -> BNode:
+        o = 1 - p
+        node = BNode("decision", inv, boards, player=p, path=path)
+        self.template_nodes += 1
+        street = STREETS[boards.shape[1]]
+        children: list[BNode] = []
+        labels: list[str] = []
+        for label, add in self.options(street, inv, p, bet, raises, checked, root=path == ""):
+            labels.append(label)
+            if label == "f":
+                children.append(BNode("fold", inv, boards, folder=p, path=path + "f"))
+            elif label == "x":
+                children.append(self._next(boards, inv, path + "x", False) if checked
+                                else self._decide(boards, inv, o, bet, raises, path + "x", checked=True))
+            else:
                 new_inv = (inv[0] + (add if p == 0 else 0), inv[1] + (add if p == 1 else 0))
-                new_bet = (bet[0] + (add if p == 0 else 0), bet[1] + (add if p == 1 else 0))
-                opts.append((label, self._decide(boards, new_inv, o, new_bet,
-                                                 raises + (1 if to_call else 0), path + label)))
-        node.actions = [a for a, _ in opts]
-        node.children = [c for _, c in opts]
-        self.decision_cells += len(opts) * node.batch
+                if label == "c":
+                    allin = self.cfg.stack - new_inv[o] <= 1e-9 or self.cfg.stack - new_inv[p] <= 1e-9
+                    children.append(self._next(boards, new_inv, path + "c", allin))
+                else:
+                    new_bet = (bet[0] + (add if p == 0 else 0), bet[1] + (add if p == 1 else 0))
+                    raised = 1 if bet[o] - bet[p] > 0 else 0
+                    children.append(self._decide(boards, new_inv, o, new_bet, raises + raised, path + label))
+        node.actions = labels
+        node.children = children
+        self.decision_cells += len(labels) * node.batch
         return node
 
 
@@ -254,7 +300,8 @@ class BatchedSubgameCFR:
     """Drop-in counterpart of ``SubgameCFR`` (same variants and outputs)."""
 
     def __init__(self, board, ranges, cfg: TreeConfig, variant: str = "dcfr",
-                 device: str | None = None, dtype=torch.float32, memory_limit_gb: float = 6.0) -> None:
+                 device: str | None = None, dtype=torch.float32, memory_limit_gb: float = 6.0,
+                 root: RootState | None = None) -> None:
         if variant not in ("dcfr", "cfr+"):
             raise ValueError(f"unknown CFR variant {variant!r}")
         self.variant = variant
@@ -263,7 +310,7 @@ class BatchedSubgameCFR:
         self.cfg = cfg
         self.board = tuple(board)
         builder = BatchedBuilder(cfg, self.device, dtype)
-        self.root = builder.build(self.board)
+        self.root = builder.build(self.board, root)
         self.template_nodes = builder.template_nodes
         bytes_needed = 2 * builder.decision_cells * N * torch.finfo(dtype).bits // 8
         self.memory_gb = bytes_needed / 1e9

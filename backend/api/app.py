@@ -35,7 +35,7 @@ class CreateGame(BaseModel):
     stack: int = Field(10_000, gt=0, le=10_000_000)
     small_blind: int = Field(50, gt=0)
     big_blind: int = Field(100, gt=0)
-    opponents: Literal["random", "station", "rule", "pushfold", "mixed"] = "mixed"
+    opponents: Literal["random", "station", "rule", "pushfold", "realtime", "mixed"] = "mixed"
     seed: int | None = Field(None, ge=0, lt=2**63)
 
     @model_validator(mode="after")

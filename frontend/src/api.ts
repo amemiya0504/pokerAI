@@ -107,7 +107,7 @@ export interface CreateGameRequest {
   stack: number
   small_blind: number
   big_blind: number
-  opponents: 'random' | 'station' | 'rule' | 'pushfold' | 'mixed'
+  opponents: 'random' | 'station' | 'rule' | 'pushfold' | 'realtime' | 'mixed'
   seed?: number
 }
 

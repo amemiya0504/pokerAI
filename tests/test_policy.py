@@ -152,3 +152,19 @@ def test_exploitability_tool_reproduces_the_solver_and_measures_a_policy():
                             device="cpu", dtype=torch.float64, max_iterations=100)
     assert uniform.solver_pct_pot <= 0.5 + 1e-9 or uniform.solver_pct_pot < uniform.policy_pct_pot
     assert uniform.policy_pct_pot > 5 * uniform.solver_pct_pot
+
+
+def test_head_to_head_is_zero_against_itself_and_positive_against_uniform():
+    from backend.dataset.spots import DEFAULT_TREES, make_spot, tree_config
+    from backend.engine.cards import parse_cards
+    from backend.policy.exploit import average_table, head_to_head, table_policy
+    from backend.solver.subgame_gpu import BatchedSubgameCFR
+
+    spot = make_spot(3, 0, {"river": 1.0})
+    cfr = BatchedSubgameCFR(parse_cards(spot.board), spot.ranges(), tree_config(spot, DEFAULT_TREES),
+                            device="cpu", dtype=torch.float64)
+    cfr.iterate(100)
+    solved = table_policy(average_table(cfr))
+    assert head_to_head(spot, solved, solved, cfr, 0.0).a_advantage_chips == pytest.approx(0, abs=1e-9)
+    uniform = lambda ctx: np.full((len(ctx["actions"]), len(ctx["combos"])), 1 / len(ctx["actions"]))  # noqa: E731
+    assert head_to_head(spot, solved, uniform, cfr, 0.0).a_advantage_chips > 0
