@@ -109,3 +109,45 @@ def test_back_to_back_cuda_solves_with_garbage_collection():
         gc.collect()
     leftovers.clear()
     gc.collect()
+
+
+def test_equity_matrix_equals_explicit_runouts():
+    """W @ r must equal averaging the showdown over every river card, as the
+    explicit chance subtree does (turn board: 44 valid rivers per combo pair)."""
+    import numpy as np
+
+    from backend.solver.subgame import CARD_COMBOS, Showdown, board_mask
+    from backend.solver.subgame_gpu import EquityMatrix
+
+    rng = np.random.default_rng(3)
+    board = (0, 13, 26, 40)
+    r = rng.random(1326) * (rng.random(1326) < 0.3) * board_mask(board)
+    w = EquityMatrix(board, "cpu", torch.float64).net_mass(torch.as_tensor(r)[None])[0].numpy()
+    want = np.zeros(1326)
+    for c in range(52):
+        if c in board:
+            continue
+        m = np.ones(1326)
+        m[CARD_COMBOS[c]] = 0
+        want += m * Showdown(board + (c,)).net_mass(r * m)
+    np.testing.assert_allclose(w, want / 44, atol=1e-10)
+
+
+def test_checkdown_tree_has_no_later_betting():
+    from backend.solver.subgame_gpu import BatchedSubgameCFR
+
+    b = parse_cards("Ks7d4c")
+    cfg = TreeConfig(10, 30, {"flop": [0.5]}, {"flop": [1.0]}, 1, True)
+    ranges = (parse_range("TT+,AKs", b), parse_range("99+,AQs+", b))
+    cfr = BatchedSubgameCFR(b, ranges, cfg, device="cpu", dtype=torch.float64, checkdown=True)
+
+    def kinds(node, out):
+        out.add((node.kind, node.batch))
+        for c in node.children:
+            kinds(c, out)
+        return out
+
+    seen = kinds(cfr.root, set())
+    assert ("chance", 1) not in seen and all(batch == 1 for _, batch in seen)  # no turn/river subtrees
+    cfr.iterate(200)
+    assert cfr.exploitability()["exploitability_pct_pot"] < 0.5

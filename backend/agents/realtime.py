@@ -4,16 +4,17 @@ Design: docs/realtime-agent.md. On the turn and river the agent tracks both
 players' ranges, re-solves the subgame rooted at the actual state (actual bet
 sizes, so no action translation) on the GPU within a time budget, and plays
 its combo's strategy (SOLVER_APPROX). If solving is not possible it falls
-back to the policy network (NEURAL_APPROX). Preflop uses the push/fold agent
-(solved when short, rule-based otherwise); the flop and multi-way pots use
-the rule-based agent (HEURISTIC). Every decision says which applied and why.
+back to the policy network (NEURAL_APPROX). On the flop it solves a
+depth-limited tree (turn and river dealt without betting; SOLVER_APPROX, the
+reason says so). Preflop uses the push/fold agent (solved when short,
+rule-based otherwise); multi-way pots use the rule-based agent (HEURISTIC).
+Every decision says which applied and why.
 
 Range tracking (public beliefs, no private information):
 
 * preflop: a heuristic top-X% range by the player's preflop line (labelled);
-* flop: a heuristic likelihood from made-hand strength (labelled);
-* turn/river, own actions: the exact strategy the agent used;
-* turn/river, opponent actions: the subgame is re-solved at the opponent's
+* postflop, own actions: the exact strategy the agent used;
+* postflop, opponent actions: the subgame is re-solved at the opponent's
   decision (with his actual bet size added to the tree) and the range is
   multiplied by each combo's probability of that action. This assumes the
   opponent plays the equilibrium (self-play assumption, replaced by M8's
@@ -43,9 +44,15 @@ RANGE_FLOOR = 0.02  # every combo keeps a little weight: the heuristics can be w
 
 # Bet abstraction for real-time trees (pot fractions), per street of the subgame.
 TREES = {
+    # Flop: depth-limited (turn and river dealt without betting), so the tree is small.
+    "flop": ({"flop": [0.33, 0.75]}, {"flop": [1.0]}, 2),
     "river": ({"river": [0.33, 0.75, 1.5]}, {"river": [1.0]}, 2),
     "turn": ({"turn": [0.5, 1.0], "river": [0.5, 1.0]}, {"turn": [1.0], "river": [1.0]}, 1),
 }
+
+
+def _street_name(board) -> str:
+    return {3: "flop", 4: "turn", 5: "river"}[len(board)]
 
 
 # ----------------------------------------------------------------------------- public replay
@@ -260,7 +267,7 @@ class RealtimeAgent:
     def _cfg(st: StreetState, oop: int, ip: int):
         from backend.solver.subgame import TreeConfig
 
-        bets, raises, max_raises = TREES["river" if len(st.board) == 5 else "turn"]
+        bets, raises, max_raises = TREES[_street_name(st.board)]
         stack = min(st.behind_start[oop], st.behind_start[ip])
         return TreeConfig(st.pot_start, stack, bets, raises, max_raises, True)
 
@@ -273,7 +280,7 @@ class RealtimeAgent:
 
         raises = st.raises
         if allow_raise:
-            max_raises = TREES["river" if len(st.board) == 5 else "turn"][2]
+            max_raises = TREES[_street_name(st.board)][2]
             raises = min(raises, max_raises - 1)
         return RootState((st.bets[oop], st.bets[ip]), 0 if actor == oop else 1, raises,
                          actor == ip and st.oop_checked and st.bets[oop] == st.bets[ip] == 0, extra)
@@ -290,7 +297,8 @@ class RealtimeAgent:
         t0 = time.perf_counter()
         cfr = BatchedSubgameCFR(st.board, (ranges[oop], ranges[ip]), self._cfg(st, oop, ip),
                                 device=self.device, dtype=torch.float32,
-                                root=self._root(st, actor, oop, ip, extra, allow_raise))
+                                root=self._root(st, actor, oop, ip, extra, allow_raise),
+                                checkdown=len(st.board) == 3)
         build = time.perf_counter() - t0
         done, evals, ex = 0, 0, None
         timing = getattr(self, "_timing", None)
@@ -315,17 +323,17 @@ class RealtimeAgent:
         run(10)  # warm-up and CUDA graph capture: slow, not used for timing
         per_it = run(25) / 25
         eval_cost = check()
-        # Two more chunks filling the budget, one exploitability check after each
-        # (stop early if the target is reached after the first).
-        for share in (0.5, 1.0):
-            if ex <= self.target:
-                break
+        # Check after chunks that double in size (35, 70, 140, ... iterations) so
+        # an easy spot stops early and checking stays a small share of the time;
+        # the last chunk is whatever still fits before the deadline.
+        while ex > self.target:
             left = deadline - time.perf_counter() - eval_cost
-            n = int(left * share / per_it)
-            if n < 5:
+            fits = int(left / per_it)
+            if fits < 5:
                 break
-            run(n)
-            check()
+            n = min(done, fits)
+            per_it = run(n) / n
+            eval_cost = check()
         return cfr, {"iterations": done, "exploitability_pct_pot": ex, "build_seconds": build,
                      "checks": evals, "seconds": time.perf_counter() - t0}
 
@@ -384,17 +392,13 @@ class RealtimeAgent:
                     m.ranges[seat] = m.ranges[seat] * lik
                 continue
             st = act.before
-            if st.street is Street.FLOP:
-                m.ranges[seat] = m.ranges[seat] * heuristic_likelihood(act.action, strength_percentile(st.board))
-                continue
             lik = None
             if self.mode == "solve":
                 try:
                     extra = ()
                     if act.action in (ActionType.BET, ActionType.RAISE) and not act.all_in:
                         extra = (round(self._fraction(act, oop, ip), 4),)
-                    pending = sum(1 for a in actions[k:] if a.seat != view.seat
-                                  and a.before.street is not Street.FLOP)
+                    pending = sum(1 for a in actions[k:] if a.seat != view.seat)
                     deadline = t0 + budget * (1 - (pending - 1) / max(pending, 1)) \
                         if pending > 1 else t0 + budget
                     aggressive = act.action in (ActionType.BET, ActionType.RAISE)
@@ -412,8 +416,8 @@ class RealtimeAgent:
     def _network_likelihood(self, view, st, m, seat, act, oop, ip) -> np.ndarray:
         from backend.solver.subgame_gpu import BatchedBuilder
 
-        if self._network() is None:
-            m.notes.append("no policy network: heuristic range update")
+        if self._network() is None or len(st.board) == 3:  # the network has no flop training
+            m.notes.append("heuristic range update")
             return heuristic_likelihood(act.action, strength_percentile(st.board))
 
         aggressive = act.action in (ActionType.BET, ActionType.RAISE)
@@ -467,14 +471,6 @@ class RealtimeAgent:
         spent = self._update_ranges(view, m, actions, oop, ip, budget=0.3 * self.seconds)
         me = view.seat
 
-        if view.street is Street.FLOP:
-            d = self._rule.act(view, legal)
-            kind = {ActionType.FOLD: ActionType.FOLD, ActionType.CHECK: ActionType.CHECK,
-                    ActionType.CALL: ActionType.CALL}.get(d.action.type, ActionType.BET)
-            m.own_likelihood.append(heuristic_likelihood(kind, strength_percentile(tuple(view.board))))
-            return Decision(d.action, StrategySource.HEURISTIC,
-                            reason=f"flop: real-time solving not supported yet (Phase B); {d.reason}")
-
         from backend.solver.subgame import COMBO_INDEX
 
         a, b = sorted(view.hole_cards)
@@ -483,7 +479,7 @@ class RealtimeAgent:
         ranges[me] = np.maximum(ranges[me], 0)
         if ranges[me][hero] <= 0:
             ranges[me][hero] = RANGE_FLOOR  # our own combo must be in our range
-        street = "river" if len(view.board) == 5 else "turn"
+        street = _street_name(view.board)
         fallback_reason = "mode=network"
         if self.mode == "solve":
             try:
@@ -496,9 +492,10 @@ class RealtimeAgent:
                 cfr.release()
                 k = self._sample(avg[:, hero])
                 m.own_likelihood.append(avg[k])
+                kind = "flop, depth-limited: turn and river dealt without betting" if street == "flop" else street
                 return Decision(self._to_engine(labels[k], adds[k], view, legal), StrategySource.SOLVER_APPROX,
                                 action_probs={l: round(float(p), 4) for l, p in zip(labels, avg[:, hero])},
-                                reason=(f"real-time solve ({street}): {info['iterations']} iterations, "
+                                reason=(f"real-time solve ({kind}): {info['iterations']} iterations, "
                                         f"exploitability {info['exploitability_pct_pot']:.2f}% pot, "
                                         f"{info['seconds']:.1f}s (tree {info['build_seconds']:.1f}s); "
                                         f"range updates {spent:.1f}s"))
@@ -509,13 +506,13 @@ class RealtimeAgent:
     def _network_decision(self, view, legal, st, ranges, me, oop, ip, hero, street, why) -> Decision:
         from backend.solver.subgame_gpu import BatchedBuilder
 
-        if self._network() is None:
+        if self._network() is None or street == "flop":  # no network for the flop
             d = self._rule.act(view, legal)
             kind = {ActionType.FOLD: ActionType.FOLD, ActionType.CHECK: ActionType.CHECK,
                     ActionType.CALL: ActionType.CALL}.get(d.action.type, ActionType.BET)
             self._mem.own_likelihood.append(heuristic_likelihood(kind, strength_percentile(tuple(view.board))))
-            return Decision(d.action, StrategySource.HEURISTIC,
-                            reason=f"{why}; no policy network model at {self.model_path}; {d.reason}")
+            missing = "no flop policy network" if street == "flop" else f"no policy network model at {self.model_path}"
+            return Decision(d.action, StrategySource.HEURISTIC, reason=f"{why}; {missing}; {d.reason}")
 
         opts = BatchedBuilder(self._cfg(st, oop, ip), "cpu", None).root_options(st.board, self._root(st, me, oop, ip))
         labels = [a for a, _ in opts]

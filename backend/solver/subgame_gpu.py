@@ -141,6 +141,72 @@ class ShowdownBatch:
         return (weaker - stronger) * self.valid
 
 
+class EquityMatrix:
+    """W[h, o] = P(h beats o) - P(o beats h) over every completion of the
+    board, for combos h and o that share no card (0 otherwise). A depth-limited
+    leaf where the remaining cards are dealt without betting is worth
+    (pot/2 + investment) * (W @ opponent_reach), exactly what the explicit
+    chance-and-showdown subtree gives, at the cost of one matrix-vector product."""
+
+    def __init__(self, board: tuple[int, ...], device, dtype) -> None:
+        from backend.engine.fast_eval import runout_scores_all
+
+        scores = torch.as_tensor(runout_scores_all(board), device=device)  # (R, N), -1 = invalid
+        R = scores.shape[0]
+        a = torch.as_tensor(CARD_A, device=device)
+        b = torch.as_tensor(CARD_B, device=device)
+        disjoint = ~((a[:, None] == a[None, :]) | (a[:, None] == b[None, :])
+                     | (b[:, None] == a[None, :]) | (b[:, None] == b[None, :]))
+        acc = torch.float64 if dtype == torch.float64 else torch.float32
+        W = torch.zeros(N, N, dtype=acc, device=device)
+        count = torch.zeros(N, N, dtype=acc, device=device)
+        for s0 in range(0, R, 16):
+            sc = scores[s0:s0 + 16]
+            valid = (sc >= 0).to(acc)
+            both = valid[:, :, None] * valid[:, None, :]
+            W += (torch.sign((sc[:, :, None] - sc[:, None, :]).to(acc)) * both).sum(0)
+            count += both.sum(0)
+        W = torch.where(disjoint & (count > 0), W / count.clamp_min(1), torch.zeros_like(W))
+        self.W = W.to(dtype)
+
+    def net_mass(self, r: torch.Tensor) -> torch.Tensor:
+        return r @ self.W.T
+
+
+class BatchedEquityMatrix:
+    """One ``EquityMatrix`` per board in a batch: (B, N, N). Used when the
+    depth limit falls after a later street (e.g. flop and turn betting, river
+    dealt without betting: one matrix per turn card)."""
+
+    def __init__(self, boards: np.ndarray, device, dtype) -> None:
+        self.W = torch.stack([equity_matrix(tuple(int(c) for c in row), device, dtype).W for row in boards])
+
+    def net_mass(self, r: torch.Tensor) -> torch.Tensor:
+        return torch.bmm(self.W, r[:, :, None])[:, :, 0]
+
+
+_EQUITY_CACHE: "OrderedDict[tuple, EquityMatrix]" = None  # type: ignore[assignment]
+
+
+def equity_matrix(board: tuple[int, ...], device, dtype, cache_size: int = 64) -> EquityMatrix:
+    """``EquityMatrix`` for a board, cached: one hand re-solves the same flop
+    several times (own decisions and opponent range updates)."""
+    global _EQUITY_CACHE
+    from collections import OrderedDict
+
+    if _EQUITY_CACHE is None:
+        _EQUITY_CACHE = OrderedDict()
+    key = (tuple(sorted(board)), str(device), str(dtype))
+    m = _EQUITY_CACHE.get(key)
+    if m is None:
+        m = _EQUITY_CACHE[key] = EquityMatrix(board, device, dtype)
+        while len(_EQUITY_CACHE) > cache_size:
+            _EQUITY_CACHE.popitem(last=False)
+    else:
+        _EQUITY_CACHE.move_to_end(key)
+    return m
+
+
 def _strengths(board: tuple[int, ...]) -> np.ndarray:
     from backend.engine.fast_eval import evaluate_many
 
@@ -181,8 +247,16 @@ class BatchedBuilder:
         self._showdowns: dict[bytes, ShowdownBatch] = {}
         self._chances: dict[bytes, tuple] = {}
 
-    def build(self, board: tuple[int, ...], root: RootState | None = None) -> BNode:
+    def build(self, board: tuple[int, ...], root: RootState | None = None,
+              checkdown: bool | int = False) -> BNode:
+        """``checkdown``: depth-limited tree with betting on that many streets
+        (True = 1). When the last of them closes, the remaining cards are dealt
+        and the hand goes to showdown with no further betting (leaf value =
+        exact equity over all runouts). Cheap, but it ignores the later
+        betting, so it misvalues draws and position."""
         boards = np.array([board], dtype=np.int64)
+        depth = int(checkdown)
+        self._checkdown_after = len(board) + depth - 1 if depth else None
         if root is None:
             return self._street(boards, (0.0, 0.0), "")
         self._root_extra = tuple(root.extra_sizes)
@@ -194,6 +268,17 @@ class BatchedBuilder:
 
     def _next(self, boards, inv, path, allin: bool) -> BNode:
         k = boards.shape[1]
+        if getattr(self, "_checkdown_after", None) == k and k < 5:
+            # Depth limit: deal the rest with no betting. One equity matrix per
+            # board replaces the explicit chance and showdown subtrees.
+            node = BNode("showdown", inv, boards, path=path)
+            key = boards.tobytes()
+            cache = self.__dict__.setdefault("_equity", {})
+            if key not in cache:
+                cache[key] = (equity_matrix(tuple(int(c) for c in boards[0]), self.device, self.dtype)
+                              if len(boards) == 1 else BatchedEquityMatrix(boards, self.device, self.dtype))
+            node.sd = cache[key]
+            return node
         key = boards.tobytes()
         if k == 5:
             node = BNode("showdown", inv, boards, path=path)
@@ -301,7 +386,7 @@ class BatchedSubgameCFR:
 
     def __init__(self, board, ranges, cfg: TreeConfig, variant: str = "dcfr",
                  device: str | None = None, dtype=torch.float32, memory_limit_gb: float = 6.0,
-                 root: RootState | None = None) -> None:
+                 root: RootState | None = None, checkdown: bool | int = False) -> None:
         if variant not in ("dcfr", "cfr+"):
             raise ValueError(f"unknown CFR variant {variant!r}")
         self.variant = variant
@@ -310,7 +395,9 @@ class BatchedSubgameCFR:
         self.cfg = cfg
         self.board = tuple(board)
         builder = BatchedBuilder(cfg, self.device, dtype)
-        self.root = builder.build(self.board, root)
+        self.root = builder.build(self.board, root, checkdown)
+        self.checkdown = checkdown
+        self._pass = "single"
         self.template_nodes = builder.template_nodes
         bytes_needed = 2 * builder.decision_cells * N * torch.finfo(dtype).bits // 8
         self.memory_gb = bytes_needed / 1e9
@@ -364,7 +451,37 @@ class BatchedSubgameCFR:
         if node.kind == "fold":
             mass = self._compatible(r_o)
             return (-(half + node.inv[i]) if node.folder == i else (half + node.inv[1 - i])) * mass
+        if isinstance(node.sd, (EquityMatrix, BatchedEquityMatrix)) and self._pass != "single":
+            if self._pass == "collect":
+                self._collected.setdefault(id(node.sd), (node.sd, []))[1].append((node, r_o))
+                return torch.zeros_like(r_o)
+            return (half + node.inv[i]) * self._leaf_mass[id(node)]
         return (half + node.inv[i]) * node.sd.net_mass(r_o)
+
+    def _traverse(self, node: BNode, i: int, r_i, r_o, mode: str, avg: bool = False) -> torch.Tensor:
+        """``_walk``, but in depth-limited trees every equity leaf of one
+        traversal is evaluated in a single batched product: a first pass only
+        collects the opponent's reach at each leaf (it depends on the strategies
+        above the leaf, not on leaf values), then the real pass uses the results.
+        Each equity matrix is then read once per traversal instead of once per leaf."""
+        if not self.checkdown:
+            return self._walk(node, i, r_i, r_o, mode, avg)
+        self._pass, self._collected = "collect", {}
+        self._walk(node, i, r_i, r_o, mode, avg)
+        self._leaf_mass = {}
+        for sd, leaves in self._collected.values():
+            R = torch.stack([r for _, r in leaves])  # (L, B, N)
+            if isinstance(sd, EquityMatrix):
+                mass = (R[:, 0, :] @ sd.W.T)[:, None, :]  # (L, 1, N)
+            else:
+                mass = torch.bmm(sd.W, R.permute(1, 2, 0)).permute(2, 0, 1)  # (L, B, N)
+            for (leaf, _), m in zip(leaves, mass):
+                self._leaf_mass[id(leaf)] = m
+        self._pass = "apply"
+        try:
+            return self._walk(node, i, r_i, r_o, mode, avg)
+        finally:
+            self._pass = "single"
 
     def _walk(self, node: BNode, i: int, r_i, r_o, mode: str, avg: bool = False) -> torch.Tensor:
         if node.kind in ("fold", "showdown"):
@@ -387,7 +504,7 @@ class BatchedSubgameCFR:
         if mode == "br":
             return vals.max(dim=0).values
         v = (sigma * vals).sum(dim=0)
-        if mode == "cfr":
+        if mode == "cfr" and self._pass != "collect":
             node._delta = vals - v
             if self.variant == "dcfr":
                 node.strat_sum.mul_(self._decay).add_(r_i * sigma)
@@ -409,7 +526,7 @@ class BatchedSubgameCFR:
 
     def _one_iteration(self) -> None:
         for i in (0, 1):
-            self._walk(self.root, i, self.ranges[i], self.ranges[1 - i], "cfr")
+            self._traverse(self.root, i, self.ranges[i], self.ranges[1 - i], "cfr")
             self._apply(self.root)
 
     def _set_weights(self) -> None:
@@ -467,9 +584,9 @@ class BatchedSubgameCFR:
         with torch.no_grad():
             r0, r1 = self.ranges
             norm = float((r0 * self._compatible(r1)).sum())
-            br = [float((self.ranges[i] * self._walk(self.root, i, self.ranges[i], self.ranges[1 - i], "br")).sum()) / norm
+            br = [float((self.ranges[i] * self._traverse(self.root, i, self.ranges[i], self.ranges[1 - i], "br")).sum()) / norm
                   for i in (0, 1)]
-            ev0 = float((r0 * self._walk(self.root, 0, r0, r1, "ev", avg=True)).sum()) / norm
+            ev0 = float((r0 * self._traverse(self.root, 0, r0, r1, "ev", avg=True)).sum()) / norm
         nash_conv = br[0] + br[1]
         return {"nash_conv_chips": nash_conv,
                 "exploitability_pct_pot": 100 * nash_conv / 2 / self.cfg.pot,
@@ -508,7 +625,7 @@ class BatchedSubgameCFR:
                 return
             p, o = node.player, 1 - node.player
             sigma = self._avg(node)
-            vals = torch.stack([self._walk(child, p, reach[p] * sigma[k], reach[o], "ev", avg=True)
+            vals = torch.stack([self._traverse(child, p, reach[p] * sigma[k], reach[o], "ev", avg=True)
                                 for k, child in enumerate(node.children)])
             mass = self._compatible(reach[o])
             ev = torch.where(mass > 0, vals / mass.clamp_min(1e-30), torch.full_like(vals, float("nan")))

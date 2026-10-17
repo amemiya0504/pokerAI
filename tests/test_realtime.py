@@ -90,9 +90,10 @@ def test_agent_solves_turn_and_river_legally_and_labels_everything():
         if street in (Street.TURN, Street.RIVER) and d.strategy_source is StrategySource.SOLVER_APPROX:
             assert "real-time solve" in d.reason and "% pot" in d.reason
             assert abs(sum(d.action_probs.values()) - 1) < 1e-3
-        if street is Street.FLOP:
-            assert d.strategy_source is StrategySource.HEURISTIC and "flop" in d.reason
+        if street is Street.FLOP and d.strategy_source is StrategySource.SOLVER_APPROX:
+            assert "depth-limited" in d.reason  # turn and river dealt without betting
     assert StrategySource.SOLVER_APPROX in by_street.get(Street.RIVER, set()) | by_street.get(Street.TURN, set())
+    assert StrategySource.SOLVER_APPROX in by_street.get(Street.FLOP, set())
     assert all(StrategySource.VERIFIED_EQUILIBRIUM not in v for v in by_street.values())
 
 

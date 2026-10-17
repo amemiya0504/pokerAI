@@ -75,6 +75,28 @@ def runout_scores(board) -> np.ndarray:
     return out
 
 
+def runout_scores_all(board) -> np.ndarray:
+    """Like ``runout_scores`` but completes any 3- or 4-card board to five
+    cards (all unordered runouts): one row per runout, -1 for combos that
+    share a card with it."""
+    from itertools import combinations
+
+    board = list(board)
+    rest = [c for c in range(52) if c not in board]
+    runouts = [board + list(r) for r in combinations(rest, 5 - len(board))]
+    bmat = np.array(runouts, dtype=np.int64)
+    B = len(bmat)
+    out = np.full((B, N_COMBOS), -1, dtype=np.int64)
+    used = np.zeros((B, 52), dtype=bool)
+    used[np.arange(B)[:, None], bmat] = True
+    valid = ~(used[:, CARD_A] | used[:, CARD_B])
+    bi, ci = np.nonzero(valid)
+    hands = np.concatenate([CARD_A[ci, None], CARD_B[ci, None], bmat[bi]], axis=1)
+    chunks = np.array_split(hands, max(1, len(hands) // 400_000))
+    out[bi, ci] = np.concatenate(list(_pool().map(evaluate_many, chunks)))
+    return out
+
+
 _POOL = None
 
 
