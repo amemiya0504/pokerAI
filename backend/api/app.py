@@ -127,11 +127,19 @@ def create_app(db_url: str | None = None, *, ai_delay: float | None = None,
         seat = session.human_seat if session.human_seat in final.seats else None
         state = HandState({p["seat"]: p["start_stack"] for p in hand.start_stacks},
                           hand.button_seat, hand.small_blind, hand.big_blind, Deck(hand.deck_seed))
-        steps = [{"action": None, "view": view_json(state.observation(seat))}]
+        def replay_view() -> dict[str, Any]:
+            revealed_cards = ({
+                s: state.hole_cards(s)
+                for s in state.seats
+                if s != seat
+            } if state.is_over else None)
+            return view_json(state.observation(seat), revealed_cards=revealed_cards)
+
+        steps = [{"action": None, "view": replay_view()}]
         for s, action in final.actions:
             state.apply(action)
             steps.append({"action": {"seat": s, "type": str(action.type), "amount": action.amount},
-                          "view": view_json(state.observation(seat))})
+                          "view": replay_view()})
         return {
             "hand_id": hand.id,
             "game_id": hand.game_id,

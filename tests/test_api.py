@@ -29,6 +29,19 @@ def new_game(client, **kw) -> int:
     return r.json()["game_id"]
 
 
+@pytest.mark.parametrize("players", (3, 6, 9))
+def test_web_realtime_labels_public_method_only(client, players):
+    game_id = new_game(client, players=players, stack=10000, opponents="realtime")
+    with client.websocket_connect(f"/ws/games/{game_id}") as ws:
+        ws.receive_json()
+        messages = play_hand(ws)
+    strategies = [s["strategy"] for m in messages for s in m["seats"] if s.get("strategy")]
+    assert strategies
+    assert all(set(s) == {"label", "street"} for s in strategies)
+    assert any(s["label"] == "翻前表 · HEURISTIC" for s in strategies)
+    assert all("HU 翻後" not in s["label"] for s in strategies)
+
+
 def card_strings(obj) -> set[str]:
     """Every 2-char card string anywhere in a message."""
     out = set()
@@ -90,18 +103,50 @@ def test_play_hands_without_seeing_hidden_cards(client):
         for _ in range(8):
             msgs = play_hand(ws)
             state = session.table.last_hand
-            shown = state.result().showdown
             for seat in state.seats:
                 if seat == session.human_seat:
                     continue
                 hole = set(cards_str(state.hole_cards(seat))[i:i + 2] for i in (0, 2))
                 for m in msgs:
                     seen = card_strings(m)
-                    if seat in shown and m["hand"]["is_over"]:
-                        continue
-                    assert not hole & seen, f"seat {seat} cards leaked: {m}"
+                    if m["hand"]["is_over"]:
+                        assert hole <= seen, f"seat {seat} cards not revealed: {m}"
+                    else:
+                        assert not hole & seen, f"seat {seat} cards leaked: {m}"
             mine = set(cards_str(state.hole_cards(session.human_seat))[i:i + 2] for i in (0, 2))
             assert all(set(m["hand"]["hole_cards"]) == mine for m in msgs)
+
+
+def test_replay_same_hand_reveals_all_ai_cards_without_settling(client):
+    game_id = new_game(client, players=3, opponents="station")
+    session = session_of(client, game_id)
+    with client.websocket_connect(f"/ws/games/{game_id}") as ws:
+        ws.receive_json()
+        play_hand(ws)
+        original = session.table.last_hand
+        holes = {seat: original.hole_cards(seat) for seat in original.seats}
+        stacks = {seat: session.table.seats[seat].stack for seat in original.seats}
+        hand_count = len(client.get(f"/api/games/{game_id}/hands").json())
+
+        ws.send_json({"type": "replay_hand"})
+        msg = ws.receive_json()
+        assert msg["status"] == "playing" and msg["is_replay"]
+        assert msg["hand"]["hole_cards"] == [cards_str(holes[session.human_seat])[i:i + 2]
+                                               for i in (0, 2)]
+        while msg["status"] != "hand_over":
+            if msg.get("legal"):
+                legal = msg["legal"]
+                action = "fold" if legal["can_fold"] else "check" if legal["can_check"] else "call"
+                ws.send_json({"type": "action", "action": action})
+            msg = ws.receive_json()
+
+        replayed = session.table.last_hand
+        assert {seat: replayed.hole_cards(seat) for seat in replayed.seats} == holes
+        assert {seat: session.table.seats[seat].stack for seat in original.seats} == stacks
+        assert len(client.get(f"/api/games/{game_id}/hands").json()) == hand_count
+        assert msg["is_replay"]
+        assert all(msg["hand"]["seats"][str(seat)]["shown_cards"] is not None
+                   for seat in holes if seat != session.human_seat)
 
 
 def test_illegal_action_is_rejected(client):
@@ -133,6 +178,9 @@ def test_history_and_replay_view(client):
     assert detail["hand_no"] == 1 and detail["human_seat"] == 0
     assert detail["steps"][0]["action"] is None and detail["steps"][-1]["view"]["is_over"]
     assert len(detail["steps"][0]["view"]["hole_cards"]) == 2
+    for seat, state in detail["steps"][-1]["view"]["seats"].items():
+        if int(seat) != detail["human_seat"]:
+            assert state["shown_cards"] is not None
     assert client.get("/api/hands/9999").status_code == 404
 
 
@@ -174,3 +222,22 @@ def test_unknown_game_websocket_is_closed(client):
 
     with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws/games/999") as ws:
         ws.receive_json()
+
+
+def test_finished_hands_update_player_statistics(client):
+    from backend.api.sessions import flush_statistics
+    from backend.db import Game, OpponentModelRow, PlayerStatistic, make_engine, make_sessionmaker
+
+    game_id = new_game(client, players=3)
+    with client.websocket_connect(f"/ws/games/{game_id}") as ws:
+        ws.receive_json()
+        for _ in range(4):
+            play_hand(ws)
+    flush_statistics()
+    with make_sessionmaker(make_engine(client.db_url))() as db:
+        seating = db.get(Game, game_id).seating
+        for s in seating:
+            model = db.query(OpponentModelRow).filter_by(player_id=s["player_id"]).one()
+            assert model.sample_size == 4
+            vpip = db.query(PlayerStatistic).filter_by(player_id=s["player_id"], stat="vpip:yes").all()
+            assert all(r.n_hits <= r.n_opportunities for r in vpip)

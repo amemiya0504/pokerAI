@@ -91,7 +91,7 @@ def test_agent_solves_turn_and_river_legally_and_labels_everything():
             assert "real-time solve" in d.reason and "% pot" in d.reason
             assert abs(sum(d.action_probs.values()) - 1) < 1e-3
         if street is Street.FLOP and d.strategy_source is StrategySource.SOLVER_APPROX:
-            assert "depth-limited" in d.reason  # turn and river dealt without betting
+            assert "depth-limited" in d.reason  # river dealt without betting
     assert StrategySource.SOLVER_APPROX in by_street.get(Street.RIVER, set()) | by_street.get(Street.TURN, set())
     assert StrategySource.SOLVER_APPROX in by_street.get(Street.FLOP, set())
     assert all(StrategySource.VERIFIED_EQUILIBRIUM not in v for v in by_street.values())
@@ -141,3 +141,44 @@ def test_opponent_raising_past_the_abstraction_cap():
         h.apply(Action.bet(to) if to == 100 else Action.raise_to(to))
     v = h.observation(h.to_act)
     h.apply(agent.act(v, h.legal_actions()).action)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real-time solving test uses the GPU")
+def test_safe_resolving_takes_targets_from_the_previous_solve():
+    decisions = _play(lambda hn: RealtimeAgent(hn, seconds=2.0, resolving="safe"), lambda hn: CallingStationAgent(), 8)
+    reasons = [d.reason for st, d in decisions
+               if st is not Street.PREFLOP and d.strategy_source is StrategySource.SOLVER_APPROX]
+    assert reasons and all("re-solving" in r for r in reasons)
+    assert any("safe re-solving (targets from the previous solve)" in r for r in reasons)
+    assert any("unsafe re-solving (" in r for r in reasons)  # e.g. first to act on the flop: nothing to protect yet
+    with pytest.raises(ValueError):
+        RealtimeAgent(0, mode="network", resolving="maybe")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real-time solving test uses the GPU")
+def test_opponent_model_tracks_ranges_and_learns_across_hands():
+    from backend.opponent.model import OpponentModel
+
+    models = {1: OpponentModel()}
+    agent = RealtimeAgent(0, seconds=2.0, opponent_models=models, exploit=False)
+    reports = []
+    for hn in range(6):
+        h = _hu(hn, button=hn % 2)
+        station = CallingStationAgent()
+        while not h.is_over:
+            s = h.to_act
+            v = h.observation(s)
+            if s == 1:
+                h.apply(station.act(v, h.legal_actions()).action)
+                continue
+            d = agent.act(v, h.legal_actions())
+            h.apply(d.action)
+            if v.street is not Street.PREFLOP and d.strategy_source is StrategySource.SOLVER_APPROX:
+                assert "opponent ranges: opponent model" in d.reason
+                rep = agent.range_report()
+                assert 1 in rep["model"] and 1 in rep["selfplay"]
+                reports.append(rep)
+        agent.hand_over(h.observation(0))
+    assert models[1].hands == 6 and reports
+    off = RealtimeAgent(0, mode="network", use_opponent_model=False, opponent_models=models)
+    assert off._model_note(1) == "opponent ranges: self-play assumption"

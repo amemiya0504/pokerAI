@@ -1,8 +1,8 @@
-"""JSON views sent to browsers. Built only from ``PlayerView`` (never from
-``HandState`` internals) so a client can never see another seat's cards."""
+"""JSON views sent to browsers; AI cards are revealed only after a hand ends."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from backend.engine.actions import LegalActions
@@ -37,7 +37,11 @@ def legal_json(legal: LegalActions) -> dict[str, Any]:
     }
 
 
-def view_json(view: PlayerView) -> dict[str, Any]:
+def view_json(
+    view: PlayerView,
+    *,
+    revealed_cards: Mapping[int, tuple[int, ...]] | None = None,
+) -> dict[str, Any]:
     """The hand as one seat sees it."""
     shown = {sv.seat: sv.shown_cards for sv in view.seats if sv.shown_cards}
     hand_names = {
@@ -47,6 +51,20 @@ def view_json(view: PlayerView) -> dict[str, Any]:
     for e in view.history:
         if e.type is EventType.AWARD:
             awards[e.seat] = awards.get(e.seat, 0) + e.amount
+
+    def seat_json(sv) -> dict[str, Any]:
+        shown_cards = sv.shown_cards
+        if shown_cards is None and view.is_over and revealed_cards:
+            shown_cards = revealed_cards.get(sv.seat)
+        return {
+            "stack": sv.stack,
+            "street_bet": sv.street_bet,
+            "total_bet": sv.total_bet,
+            "folded": sv.folded,
+            "all_in": sv.all_in,
+            "shown_cards": cards(shown_cards) if shown_cards else None,
+        }
+
     return {
         "hole_cards": cards(view.hole_cards),
         "board": cards(view.board),
@@ -56,17 +74,7 @@ def view_json(view: PlayerView) -> dict[str, Any]:
         "current_bet": view.current_bet,
         "to_act": view.to_act,
         "is_over": view.is_over,
-        "seats": {
-            str(sv.seat): {
-                "stack": sv.stack,
-                "street_bet": sv.street_bet,
-                "total_bet": sv.total_bet,
-                "folded": sv.folded,
-                "all_in": sv.all_in,
-                "shown_cards": cards(sv.shown_cards) if sv.shown_cards else None,
-            }
-            for sv in view.seats
-        },
+        "seats": {str(sv.seat): seat_json(sv) for sv in view.seats},
         "events": [event_json(e) for e in view.history],
         "awards": {str(s): a for s, a in awards.items()},
         "hand_names": hand_names,

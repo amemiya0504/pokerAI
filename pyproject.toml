@@ -28,6 +28,7 @@ include = ["backend*"]
 
 [tool.setuptools.package-data]
 "backend.db" = ["migrations/script.py.mako"]
+"backend.agents" = ["data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

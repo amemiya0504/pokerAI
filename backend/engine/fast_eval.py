@@ -92,7 +92,7 @@ def runout_scores_all(board) -> np.ndarray:
     valid = ~(used[:, CARD_A] | used[:, CARD_B])
     bi, ci = np.nonzero(valid)
     hands = np.concatenate([CARD_A[ci, None], CARD_B[ci, None], bmat[bi]], axis=1)
-    chunks = np.array_split(hands, max(1, len(hands) // 400_000))
+    chunks = np.array_split(hands, max(1, len(hands) // 150_000))
     out[bi, ci] = np.concatenate(list(_pool().map(evaluate_many, chunks)))
     return out
 
@@ -103,9 +103,11 @@ _POOL = None
 def _pool():
     global _POOL
     if _POOL is None:
+        import os
         from concurrent.futures import ThreadPoolExecutor
 
-        _POOL = ThreadPoolExecutor(2, thread_name_prefix="fast_eval")
+        # NumPy releases the GIL in the heavy steps; beyond ~8 threads it stops helping.
+        _POOL = ThreadPoolExecutor(min(8, os.cpu_count() or 2), thread_name_prefix="fast_eval")
     return _POOL
 
 

@@ -1,6 +1,7 @@
 """Database models (design doc section 6): Milestone 2 tables, Milestone 3
 simulation tables, Milestone 4 strategy datasets / solver cache and
-Milestone 7 model versions / training runs.
+Milestone 7 model versions / training runs, Milestone 8 player statistics
+and opponent models.
 
 A hand's source of truth is (deck seed, button, blinds, starting stacks,
 action sequence); ``result`` and ``board`` are derived and kept for queries.
@@ -190,3 +191,33 @@ class TrainingRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     model_version: Mapped[ModelVersion] = relationship(back_populates="runs")
+
+
+class PlayerStatistic(Base):
+    """Raw counts behind an opponent model (design doc section 6): one row per
+    statistic outcome and position, keeping the denominator."""
+
+    __tablename__ = "player_statistics"
+    __table_args__ = (UniqueConstraint("player_id", "stat", "position", "street"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    player_id: Mapped[int] = mapped_column(ForeignKey("players.id"), index=True)
+    stat: Mapped[str] = mapped_column(String(48))  # "<group>:<outcome>", see backend.opponent.stats
+    position: Mapped[str] = mapped_column(String(8))
+    street: Mapped[str] = mapped_column(String(8))
+    n_opportunities: Mapped[int] = mapped_column(Integer)
+    n_hits: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class OpponentModelRow(Base):
+    """A player's current posterior (rebuilt from ``player_statistics``)."""
+
+    __tablename__ = "opponent_models"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    player_id: Mapped[int] = mapped_column(ForeignKey("players.id"), unique=True)
+    model_version: Mapped[str] = mapped_column(String(32))
+    posterior: Mapped[dict[str, Any]] = mapped_column(JSON)
+    sample_size: Mapped[int] = mapped_column(Integer)  # hands observed
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)

@@ -34,7 +34,7 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import torch  # noqa: E402
 
 from .data import Tensors  # noqa: E402
-from .model import PolicyNet  # noqa: E402
+from .model import build_model, parameter_count  # noqa: E402
 
 TARGETS = {"kl_nats": 0.15, "ev_regret_pct_pot": 1.0}  # set before training (README)
 
@@ -51,6 +51,9 @@ class TrainConfig:
     range_dim: int = 64
     dropout: float = 0.0
     seed: int = 0
+    arch: str = "mlp"  # see backend.policy.model.ARCHS
+    heads: int = 4  # transformer only
+    channels: int = 32  # cnn only
 
 
 def _set_seeds(seed: int) -> None:
@@ -82,7 +85,7 @@ def _accumulate(acc: dict[str, float] | None, m: dict[str, float]) -> dict[str, 
 
 
 @torch.no_grad()
-def evaluate(model: PolicyNet, data: Tensors, idx: torch.Tensor, batch: int = 32768) -> dict[str, float]:
+def evaluate(model, data: Tensors, idx: torch.Tensor, batch: int = 32768) -> dict[str, float]:
     model.eval()
     acc = None
     for s in range(0, len(idx), batch):
@@ -138,13 +141,14 @@ def _checkpoint(path: Path, model, opt, epoch: int, cfg: TrainConfig, history: l
 
 
 def train(cfg: TrainConfig, run_dir: Path, device: str | None = None, resume: bool = True,
-          stop_after_epoch: int | None = None, log=print) -> dict[str, Any]:
+          stop_after_epoch: int | None = None, log=None) -> dict[str, Any]:
+    log = log or (lambda *a: print(*a, flush=True))  # flushed: progress shows up in redirected logs
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     run_dir.mkdir(parents=True, exist_ok=True)
     ckpt = run_dir / "checkpoint.pt"
     _set_seeds(cfg.seed)
     data = Tensors(Path(cfg.features), device)
-    model = PolicyNet(cfg.hidden, cfg.layers, cfg.range_dim, cfg.dropout).to(device)
+    model = build_model(asdict(cfg)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     start, history, resumed_from = 0, [], None
     if resume and ckpt.exists():
@@ -189,6 +193,8 @@ def train(cfg: TrainConfig, run_dir: Path, device: str | None = None, resume: bo
     final = evaluate(model, data, data.test_idx)
     report = {
         "config": asdict(cfg),
+        "model_config": model.config,
+        "parameters": parameter_count(model),
         "device": str(device),
         "torch": torch.__version__,
         "cuda": torch.version.cuda if device.type == "cuda" else None,

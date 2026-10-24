@@ -5,6 +5,7 @@ from __future__ import annotations
 import multiprocessing as mp
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from backend.agents import CallingStationAgent, Decision, RandomAgent, RuleBasedAgent
@@ -25,6 +26,12 @@ def _pushfold(seed: int, **kw):
     return PushFoldAgent(seed, **kw)
 
 
+def _style(seed: int, **kw):
+    from backend.agents.style import StyleAgent
+
+    return StyleAgent(seed, **kw)
+
+
 def _realtime(seed: int, **kw):
     from backend.agents.realtime import RealtimeAgent
 
@@ -37,6 +44,31 @@ def _neural(seed: int, **kw):
     return RealtimeAgent(seed, mode="network", **kw)
 
 
+# Policy networks of different architectures as opponents (network mode: the
+# network plays the turn and river; preflop and flop are the shared rule-based
+# logic). Trained with ``python -m backend.policy train ... --arch``.
+_POLICY = Path(__file__).resolve().parents[2] / "out" / "policy"
+NETWORK_OPPONENTS = {
+    "linear": _POLICY / "arch-linear" / "model.pt",
+    "mlp-small": _POLICY / "arch-mlp-small" / "model.pt",
+    "mlp": _POLICY / "run-v1v2" / "model.pt",
+    "resmlp": _POLICY / "arch-resmlp" / "model.pt",
+    "cnn": _POLICY / "arch-cnn" / "model.pt",
+    "rnn": _POLICY / "arch-rnn" / "model.pt",
+    "lstm": _POLICY / "arch-lstm" / "model.pt",
+    "transformer": _POLICY / "arch-transformer" / "model.pt",
+}
+
+
+def _network_opponent(name: str):
+    def build(seed: int, **kw):
+        from backend.agents.realtime import RealtimeAgent
+
+        return RealtimeAgent(seed, mode="network", model_path=NETWORK_OPPONENTS[name], use_opponent_model=False, **kw)
+
+    return build
+
+
 REGISTRY: dict[str, Callable[..., Any]] = {
     "realtime": _realtime,
     "neural": _neural,
@@ -44,7 +76,12 @@ REGISTRY: dict[str, Callable[..., Any]] = {
     "station": lambda seed, **kw: CallingStationAgent(),
     "rule": RuleBasedAgent,
     "pushfold": _pushfold,
+    "style": _style,  # params: {"style": "tag"}
 }
+for _name in NETWORK_OPPONENTS:
+    REGISTRY[f"net-{_name}"] = _network_opponent(_name)
+for _name in ("nit", "tag", "lag", "station", "maniac"):  # M8 test opponents, one kind per preset
+    REGISTRY[f"style-{_name}"] = lambda seed, _n=_name, **kw: _style(seed, style=_n, **kw)
 
 
 @dataclass(frozen=True)

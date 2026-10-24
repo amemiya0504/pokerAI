@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.engine.records import FORMAT, hand_record, replay
 
-from .models import ActionRow, Game, Hand, Player, PokerTable
+from .models import ActionRow, Game, Hand, OpponentModelRow, Player, PlayerStatistic, PokerTable
 
 
 def create_game(
@@ -96,3 +96,61 @@ def replay_hand(hand: Hand):
     if record["result"] != hand.result:
         raise ValueError(f"hand {hand.id}: stored result does not match replay")
     return state, record
+
+
+def record_statistics(db: Session, record: dict[str, Any]) -> None:
+    """Add a finished hand's public statistics to every seated player's
+    ``player_statistics`` counts and refresh their ``opponent_models`` row
+    (Milestone 8). Only public information is used (no hole cards except
+    those shown at showdown)."""
+    from backend.opponent.model import MODEL_VERSION, OpponentModel
+    from backend.opponent.stats import GROUPS, PublicHand, group_street, observations
+
+    hand = PublicHand.from_record(record)
+    by_seat: dict[int, list] = {}
+    for o in observations(hand):
+        by_seat.setdefault(o.seat, []).append(o)
+    for p in record["players"]:
+        pid = p.get("player_id")
+        if pid is None:
+            continue
+        rows = {(r.stat, r.position, r.street): r
+                for r in db.scalars(select(PlayerStatistic).where(PlayerStatistic.player_id == pid))}
+        for o in by_seat.get(p["seat"], []):
+            street = group_street(o.group)
+            for outcome in GROUPS[o.group]:
+                key = (f"{o.group}:{outcome}", o.position, street)
+                row = rows.get(key)
+                if row is None:
+                    row = rows[key] = PlayerStatistic(player_id=pid, stat=key[0], position=o.position, street=street,
+                                                      n_opportunities=0, n_hits=0)
+                    db.add(row)
+                row.n_opportunities += 1
+                row.n_hits += int(outcome == o.outcome)
+        current = db.scalar(select(OpponentModelRow).where(OpponentModelRow.player_id == pid))
+        hands = (current.sample_size if current else 0) + 1
+        model = OpponentModel.from_statistic_rows(
+            [{"stat": r.stat, "position": r.position, "n_hits": r.n_hits} for r in rows.values()], hands=hands)
+        posterior = {"model": model.to_json(),
+                     "estimates": {g: {"opportunities": e.opportunities, "mean": e.mean, "low": e.low,
+                                       "high": e.high, "level": e.level}
+                                   for g, e in model.estimates().items() if e.opportunities}}
+        if current is None:
+            db.add(OpponentModelRow(player_id=pid, model_version=MODEL_VERSION, posterior=posterior,
+                                    sample_size=hands))
+        else:
+            current.model_version, current.posterior, current.sample_size = MODEL_VERSION, posterior, hands
+    db.commit()
+
+
+def opponent_model(db: Session, player_id: int):
+    """The player's ``OpponentModel`` rebuilt from the raw counts (None if never seen)."""
+    from backend.opponent.model import OpponentModel
+
+    rows = db.scalars(select(PlayerStatistic).where(PlayerStatistic.player_id == player_id)).all()
+    if not rows:
+        return None
+    current = db.scalar(select(OpponentModelRow).where(OpponentModelRow.player_id == player_id))
+    return OpponentModel.from_statistic_rows(
+        [{"stat": r.stat, "position": r.position, "n_hits": r.n_hits} for r in rows],
+        hands=current.sample_size if current else 0)
