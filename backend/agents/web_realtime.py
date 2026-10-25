@@ -213,6 +213,9 @@ class WebRealtimeAgent:
                 limpers = sum(s.street_bet == view.big_blind for s in view.seats) - 1
                 to = (view.current_bet * table["raise_multiple"] if view.current_bet > view.big_blind else
                       view.big_blind * (table["raise_bb"] + max(limpers, 0)))
+                me = next(s for s in view.seats if s.seat == view.seat)
+                if "jam_fraction" in table and to >= table["jam_fraction"] * (me.stack + me.street_bet):
+                    to = legal.max_raise_to  # v8: a raise committing this much of the stack is a jam
                 action = Action(legal.raise_type, min(legal.max_raise_to, max(legal.min_raise_to, round(to))))
             return Decision(action, StrategySource.HEURISTIC,
                             action_probs={"fold": float(row[0]), "check" if legal.can_check else "call": float(row[1]), "raise": float(row[2])},

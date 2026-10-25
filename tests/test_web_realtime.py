@@ -5,6 +5,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from backend.agents import web_preflop
 from backend.agents.base import StrategySource
 from backend.agents.pushfold import PushFoldAgent, preflop_order
 from backend.agents.web_preflop import (POSITIONS, TABLE_PATH, context, contexts_for, lookup, position,
@@ -14,6 +15,18 @@ from backend.engine.actions import Action
 from backend.engine.cards import Deck
 from backend.engine.hand import HandState, Street
 from backend.solver.hands import CLASS_NAMES, COMBOS, class_index
+
+
+V7_PATH = TABLE_PATH.with_name("web_preflop_v7.json")
+
+
+@pytest.fixture(autouse=True)
+def v7_tables(monkeypatch):
+    """These tests pin the schema-1 v7 table; v8 has its own tests."""
+    monkeypatch.setattr(web_preflop, "TABLE_PATH", V7_PATH)
+    tables.cache_clear()
+    yield
+    tables.cache_clear()
 
 
 def hand(n=2, seed=1, depth=100):
@@ -32,7 +45,7 @@ def test_frozen_schema_all_44_positions_and_generator_reproducibility():
     data = generate()
     assert sum(map(len, POSITIONS.values())) == 44
     assert len(data["tables"]) == sum(len(contexts_for(n, pos)) for n, ps in POSITIONS.items() for pos in ps)
-    assert runtime == generate(a3_runtime=True) == json.loads(TABLE_PATH.read_text())
+    assert runtime == generate(a3_runtime=True) == json.loads(V7_PATH.read_text())
     assert data == json.loads(Path("backend/agents/data/web_preflop_v6.json").read_text())
     assert runtime["version"] == "web-v7-a3-no-floor"
     assert "not GTO" in runtime["source"]

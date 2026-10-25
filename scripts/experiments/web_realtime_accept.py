@@ -56,7 +56,8 @@ def context_rates(counts):
 
 BB_CHIPS = 100
 
-def simulate(n, opponent, deals, seed, mode, seconds, log=print, capture_samples=False, multiway_bluff=False, deal_start=0):
+def simulate(n, opponent, deals, seed, mode, seconds, log=print, capture_samples=False, multiway_bluff=False, deal_start=0,
+             stack_bb=100):
     if deal_start < 0:
         raise ValueError("deal_start must be nonnegative")
     by_position = {pos: Counter() for pos in POSITIONS[n]}
@@ -73,7 +74,7 @@ def simulate(n, opponent, deals, seed, mode, seconds, log=print, capture_samples
         net = 0
         deal_positions = {pos: 0.0 for pos in POSITIONS[n]}
         for hero in range(n):
-            h = HandState({s: 10000 for s in range(n)}, 0, BB_CHIPS // 2, BB_CHIPS,
+            h = HandState({s: round(stack_bb * BB_CHIPS) for s in range(n)}, 0, BB_CHIPS // 2, BB_CHIPS,
                           Deck(derive_seed(seed, n, deal)))
             hero_position = position(h.observation(hero))
             agent = WebRealtimeAgent(derive_seed(seed, n, deal, hero), mode=mode, seconds=seconds, multiway_bluff=multiway_bluff)
@@ -205,17 +206,20 @@ def main():
     parser.add_argument("--seconds", type=float, default=2)
     parser.add_argument("--players", type=int, nargs="+", default=list(range(2, 10)))
     parser.add_argument("--out", default="out/web-realtime/cpu.json")
+    parser.add_argument("--stack-bb", type=float, default=100)
     args = parser.parse_args()
-    if args.deals < 2 or any(n not in range(2, 10) for n in args.players) or args.seconds <= 0:
-        parser.error("need at least 2 deals, 2–9 players and positive seconds")
+    if args.deals < 2 or any(n not in range(2, 10) for n in args.players) or args.seconds <= 0 or args.stack_bb < 1:
+        parser.error("need at least 2 deals, 2–9 players, positive seconds and at least 1 BB stacks")
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     seed = CPU_SEED if args.phase == "cpu" else ARENA_SEED
     table_hash = hashlib.sha256(TABLE_PATH.read_bytes()).hexdigest()
-    report = {"config": vars(args), "seed": seed, "table_sha256": table_hash, "rows": {}}
+    # The default 100 BB depth stays out of the config so earlier reports remain resumable.
+    config = {k: v for k, v in vars(args).items() if k != "stack_bb" or v != 100}
+    report = {"config": config, "seed": seed, "table_sha256": table_hash, "rows": {}}
     if out.exists():
         previous = json.loads(out.read_text())
-        if (previous.get("config") == vars(args) and previous.get("seed") == seed
+        if (previous.get("config") == config and previous.get("seed") == seed
                 and previous.get("table_sha256") == table_hash):
             report = previous
     for n in args.players:
@@ -224,7 +228,7 @@ def main():
             if opponent in opponents:
                 continue
             row = simulate(n, opponent, args.deals, report["seed"],
-                           "network" if args.phase == "cpu" else "solve", args.seconds)
+                           "network" if args.phase == "cpu" else "solve", args.seconds, stack_bb=args.stack_bb)
             opponents[opponent] = row
             out.write_text(json.dumps(report, indent=2))
             print(f"{n}max vs {opponent}: {row['profit']}", flush=True)

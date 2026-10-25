@@ -14,7 +14,7 @@
 | M6 · GTO Dataset Pipeline | ✅ 完成（見下方驗收結果） |
 | M7 · GTO Policy Network | ⚠️ 模仿指標達標，但策略本身仍高度可被剝削（見下方） |
 | 即時求解 Agent · A、B、C 階段 | ✅ M8 對手模型已接入；原 Arena Agent 保持基準路徑 |
-| Web AI 2–9 人 | 🔄 A1–A6 CPU 診斷完成；v7 的 3,000-deal GPU Arena 驗收進行中 |
+| Web AI 2–9 人 | ✅ v7 通過 3,000-deal Arena gate（2–9-max）；⚠️ 翻前 v8 未通過驗收（40 BB 對 station 3–9-max 顯著為負）；🔄 v8.1（open／vs-open 回到 v7，保留 3bet+／all-in 節點）驗收進行中 |
 | M8 · Opponent Modeling | ✅ 完成（門檻版本 2、新種子重跑通過；版本 1 的結果與原因見下方「M8 驗收結果」） |
 | M9 · Exploit Engine | ⚠️ 精確前置檢查通過；Arena E1 未過、E2 通過（見下方「M9 驗收結果」） |
 | M10 | 未開始 |
@@ -567,9 +567,22 @@ A5 range-source 配對只改 equity 的對手 range 來源：兩組使用同一�
 
 6-max 另做 200 deals/對手的低樣本風格篩查：station +65.51 [−101.08,+232.09]、nit −34.36 [−86.12,+17.39]、maniac −25.92 [−110.87,+59.04] bb/100；三者 CI 都跨 0，不能判定通過或退步，原始資料在 out/web-realtime/a5-range-paired-style-6max-200.json。5–9-max 的完整 rule 對照不含 2–4 人桌；style 對手也尚未完成有足夠樣本的驗收。
 
-A6 的 pot-odds 邊界測試與 5–9-max 配對 CPU 診斷已通過；A7 增加後 `tests/test_web_realtime.py` 為 52 passed。全專案最近一次結果是 A7 前的 249 passed（652.34 秒），Arena 結束前尚未重跑全套。v7 全桌 Arena 正在跑，報告寫入 `out/web-realtime/a6-arena-v7-3000.json`。M9 的 rule 輸出、門檻、種子未修改。
+A6 的 pot-odds 邊界測試與 5–9-max 配對 CPU 診斷已通過；A7 增加後 `tests/test_web_realtime.py` 為 52 passed。全專案最近一次結果是 A7 前的 249 passed（652.34 秒），Arena 結束前尚未重跑全套。v7 全桌 Arena（3,000 deals × 16 組、seed 20261029）已完成並通過固定 gate：對 rule 2–9-max 依序 +41.65、+19.06、+24.48、+19.06、+7.61、+8.07、+10.85、+5.87 bb/100，其中 6、7、9-max 的 95% CI 跨 0（gate 只要求不顯著為負）；對 station 全部顯著為正；逐位置棄牌與 cheap gate 全部通過。報告：`out/web-realtime/a6-arena-v7-3000.json`。M9 的 rule 輸出、門檻、種子未修改。
 
 設計：[`docs/realtime-agent.md`](docs/realtime-agent.md)。M7 的網路策略本身高度可被剝削，所以實際對戰改成**做決策當下對子賽局求解**，網路只當備援。目前只做單挑。
+
+### 翻前 v8（深度分桶、vs 3bet／4bet／all-in；2026-10-25 驗收未通過）
+
+**驗收（門檻在執行前訂定）**：100 BB 固定 Arena gate 通過；150 BB v8−v7 配對 16 組都不顯著為負；40 BB 配對對 rule 8 組都不顯著為負，但**對 station 3–9-max 全部顯著為負（約 −40～−52 bb/100）**，所以 v8 未通過，不取代 v7。詳細數字與診斷見 `docs/HANDOFF.md`。
+
+網頁 runtime 改讀 `backend/agents/data/web_preflop_v8.json.gz`（schema 2，10,780 張表）；v1–v7 保留，`web_preflop.py` 依 schema 分流，載入 v7 時行為與先前完全相同，所以 `web_policy_ab.py --baseline v7 --candidate v8` 是單一變因比較。產生器：`python -m scripts.experiments.web_preflop_v8_tables`（先用 `... equity` 產生 `data/preflop/hu_equity_169.npz`，2,000 samples、seed 0、24 workers）。
+
+- **Key**：`{人數}/{深度}/{位置}/{情境}:{price}`。深度依有效籌碼分 20／40／60／100／150 BB 桶（<30、<50、<80、<125、≥125）；5–20 BB 有已解 push/fold cell 時照舊優先。
+- **情境**：保留 A3 的 open／limp／option、vs open（前位／後位 × 尺寸）、SB／BB 單挑／多人分流；新增 `vs_3bet_{early,late}_{small,large}`（自己 open 後被 3bet；3bet ≤ 3.5× open 為 small）、`cold_vs_3bet`、`vs_4bet_{early,late}`（自己 3bet 後被 4bet）、`vs_4bet_cold`、`vs_5bet`，以及 `vs_allin_{early,late}_{unopened,after_open,after_3bet,cold}`。前位＝CO 之前的座位，對手位置只分前位／後位。
+- **非 all-in 節點**：沿用 v7 的 WIDTHS／sigmoid 校準，乘上每個深度的係數，標 HEURISTIC；尺寸依深度（20–60 BB open 2.0–2.3 BB），加注到超過自身籌碼 40% 時改為 all-in。
+- **all-in 節點**：表內存每手牌對「假設的推牌範圍」的 equity（169×169 類別 equity 矩陣含牌張阻擋權重）；runtime 依該手實際底池賠率決定跟注（打平點附近 ±1% equity 平滑），後面每多一位未行動玩家要求 +3% equity，已投入的多位對手以 eq^k 近似。推牌範圍是 heuristic（依深度、狀態、前位／後位），多人部分是近似，仍標 HEURISTIC、不是 GTO。
+- **測試**：`tests/test_web_preflop_v8.py`（28 項：產生器可重現、key 覆蓋、每個新節點的牌局場景、深度分桶、all-in 價格公式、大額加注改 all-in、2–9 人各深度合法性）；`tests/test_web_realtime.py` 固定使用 v7 表，53 項仍通過。
+- **冒煙（CPU、診斷用，不是驗收）**：v8−v7 配對，6-max vs rule 100 BB 200 deals −1.37 [−4.05,+1.31]、3-max +0.88 [−0.84,+2.59]；6-max vs rule 40 BB 100 deals +9.96 [+1.29,+18.63] bb/100。`web_realtime_accept.py`／`web_policy_ab.py` 新增 `--stack-bb`（預設 100 時不寫入 config，舊報告仍可續跑）。
 
 ### 每個決策怎麼做、怎麼標示
 

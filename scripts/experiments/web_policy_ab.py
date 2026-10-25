@@ -88,6 +88,7 @@ def main() -> None:
     parser.add_argument("--baseline-multiway-bluff", action="store_true")
     parser.add_argument("--candidate-multiway-bluff", action="store_true")
     parser.add_argument("--out", default="out/web-realtime/a1-paired-cpu.json")
+    parser.add_argument("--stack-bb", type=float, default=100)
     args = parser.parse_args()
     if args.deals < 2 or args.seconds <= 0 or any(n not in range(2, 10) for n in args.players):
         parser.error("need at least 2 deals, 2–9 players and positive seconds")
@@ -106,6 +107,8 @@ def main() -> None:
               "baseline_cheap_call_floor_control": args.baseline_cheap_call_floor_control,
               "baseline_multiway_bluff": args.baseline_multiway_bluff,
               "candidate_multiway_bluff": args.candidate_multiway_bluff}
+    if args.stack_bb != 100:  # default depth stays out of the config so earlier reports remain resumable
+        config["stack_bb"] = args.stack_bb
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     hashes = {key: hashlib.sha256(path.read_bytes()).hexdigest() for key, path in paths.items()}
@@ -142,7 +145,8 @@ def main() -> None:
                                       else args.candidate_multiway_bluff)
                     result = experiment.simulate(n, opponent, args.deals, args.seed, "network", args.seconds,
                                                  log=lambda message, **kwargs: print(f"{label} {message}", **kwargs),
-                                                 capture_samples=True, multiway_bluff=multiway_bluff)
+                                                 capture_samples=True, multiway_bluff=multiway_bluff,
+                                                 stack_bb=args.stack_bb)
                     variants[label] = result
                 baseline, candidate = variants[args.baseline_label], variants[args.candidate_label]
                 deltas = {"overall": paired_delta(baseline["_samples"]["profit"],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import math
 from dataclasses import replace
@@ -17,7 +18,7 @@ from backend.solver.hands import CLASS_NAMES, COMBOS, class_index
 
 from .pushfold import PushFoldAgent, preflop_order
 
-TABLE_PATH = Path(__file__).with_name("data") / "web_preflop_v7.json"
+TABLE_PATH = Path(__file__).with_name("data") / "web_preflop_v8_1.json.gz"
 POSITIONS = {
     2: ("BTN/SB", "BB"),
     3: ("BTN", "SB", "BB"),
@@ -111,9 +112,15 @@ def context(view: PlayerView, legal: LegalActions) -> str:
 
 @lru_cache(maxsize=1)
 def tables() -> dict:
-    data = json.loads(TABLE_PATH.read_text())
-    if data.get("schema") != 1 or data.get("hands") != list(CLASS_NAMES) or data.get("actions") != ["fold", "passive", "raise"]:
+    raw = TABLE_PATH.read_bytes()
+    data = json.loads(gzip.decompress(raw) if TABLE_PATH.suffix == ".gz" else raw)
+    if data.get("schema") not in (1, 2) or data.get("hands") != list(CLASS_NAMES) or data.get("actions") != ["fold", "passive", "raise"]:
         raise ValueError("invalid frozen web preflop schema")
+    if data["schema"] == 2:
+        from .web_preflop_v8 import validate
+
+        validate(data)
+        return data
     expected = {f"{n}/{p}/{c}" for n, ps in POSITIONS.items() for p in ps
                  for c in contexts_for(n, p)}
     legacy = {f"{n}/{p}/{c}" for n, ps in POSITIONS.items() for p in ps for c in LEGACY_CONTEXTS}
@@ -132,8 +139,24 @@ def tables() -> dict:
 
 
 def lookup(view: PlayerView, legal: LegalActions) -> tuple[np.ndarray, dict, str]:
-    key = f"{len(view.seats)}/{position(view)}/{context(view, legal)}"
     data = tables()
+    if data["schema"] == 2:
+        from .web_preflop_v8 import lookup as v8_lookup
+
+        probs, table, key = v8_lookup(view, legal, data)
+    else:
+        probs, table, key = _v7_lookup(view, legal, data)
+    if legal.can_check or not legal.can_fold:
+        probs[:, 1] += probs[:, 0]
+        probs[:, 0] = 0
+    if not legal.can_raise:
+        probs[:, 1] += probs[:, 2]
+        probs[:, 2] = 0
+    return probs, table, key
+
+
+def _v7_lookup(view: PlayerView, legal: LegalActions, data: dict) -> tuple[np.ndarray, dict, str]:
+    key = f"{len(view.seats)}/{position(view)}/{context(view, legal)}"
     if key not in data["tables"]:
         group, price = key.rsplit("/", 1)[-1].split(":")
         if group.startswith("bb_vs_open_single_") or group.startswith("bb_vs_open_multi_"):
@@ -159,14 +182,7 @@ def lookup(view: PlayerView, legal: LegalActions) -> tuple[np.ndarray, dict, str
             group = "limped"
         key = f"{len(view.seats)}/{position(view)}/{group}:{price}"
     table = data["tables"][key]
-    probs = np.array(table["probs"], dtype=float)
-    if legal.can_check or not legal.can_fold:
-        probs[:, 1] += probs[:, 0]
-        probs[:, 0] = 0
-    if not legal.can_raise:
-        probs[:, 1] += probs[:, 2]
-        probs[:, 2] = 0
-    return probs, table, key
+    return np.array(table["probs"], dtype=float), table, key
 
 
 def effective_bb(view: PlayerView) -> float:

@@ -1,6 +1,52 @@
-# 交接：目前進度與下一步（2026-10-24，已暫停，準備移至另一台電腦）
+# 交接：目前進度與下一步（2026-10-24，已移至新電腦續跑）
 
-## 暫停檢查點（2026-10-24 19:43 CST；本節是目前權威狀態）
+## 新電腦續跑（2026-10-24 21:50 CST；本節優先於下方暫停檢查點）
+
+- 新電腦：WSL Ubuntu 26.04、32 核、RTX 4060 Ti 16 GB。`.venv` 以 uv 建立（Python 3.12，系統缺 python3-venv），含 `.[web,sim,solver,dev,oracle]` 與 torch 2.11.0+cu128。out 資料自 tar 還原；`backend/opponent/m9.py` 與 `out/m9/m9-gates.sha256` 相符。
+- **A6 Arena v7 完成並通過固定 gate**（`acceptance.passed = true`，2–9-max 完整覆蓋）。7–9-max station 組依下方指令重跑；parallel-5…9 經 seed／table SHA／config 斷言後合併到 `out/web-realtime/a6-arena-v7-3000.json`，gate 未修改。合併前備份在 `out/web-realtime/backup-20261024/`。單位 bb/100、95% CI：
+
+| 人數 | vs rule | vs station |
+|---:|---:|---:|
+| 2 | +41.65 [+28.35,+54.95] | +379.39 [+308.98,+449.80] |
+| 3 | +19.06 [+7.69,+30.43] | +1085.04 [+1013.13,+1156.96] |
+| 4 | +24.48 [+12.98,+35.98] | +1363.25 [+1274.86,+1451.64] |
+| 5 | +19.06 [+5.89,+32.23] | +1588.74 [+1488.16,+1689.31] |
+| 6 | +7.61 [−3.53,+18.74] | +1621.33 [+1516.85,+1725.81] |
+| 7 | +8.07 [−2.57,+18.72] | +1605.52 [+1501.41,+1709.64] |
+| 8 | +10.85 [+0.69,+21.01] | +1645.15 [+1540.29,+1750.02] |
+| 9 | +5.87 [−3.60,+15.35] | +1650.22 [+1543.05,+1757.38] |
+
+- 6、7、9-max 對 rule 的 CI 跨 0：gate 只要求「不顯著為負」，不代表對 rule 有確定優勢。逐位置非退化棄牌與 cheap gate 全部通過。
+- 注意：manifest 記錄的 `backend/agents/web_realtime.py`、`scripts/experiments/web_realtime_accept.py` SHA 與續跑時不同（差異為之後加入、預設關閉的 A7 `multiway_bluff`，Arena 未開啟）；7–9-max station 組在較快 CPU 上以 2 秒預算重跑。
+- 下一步：A7 與 A2–A5 的 2–4-max 配對以 CPU 在 `~/poker` 背景續跑；翻前 v8（2–9 人、深度分桶、vs 3bet／4bet／all-in）在獨立 worktree 開發，不影響這些實驗。network_opponents.py 與全專案 pytest 留到 v8 程式定案後再跑。
+
+### 翻前 v8（worktree `~/poker-v8`，branch `preflop-v8`）
+
+- 實作與測試完成，內容見 README「翻前 v8」。`~/poker-v8/out` 是指向 `~/poker/out` 的 symlink；`~/poker-v8/.venv` 獨立。
+- **v8 驗收門檻（2026-10-24 22:15 CST，使用者確認、執行前訂定，不事後調整）**：
+  1. **100 BB**：`web_realtime_accept.py --phase arena --deals 3000 --seconds 2`，seed 20261029，2–9-max × rule／station 共 16 組，沿用 A6 的固定 `gate(rows, "arena")` 並要求 2–9-max 完整覆蓋。2-max 用 GPU、3–9-max 隱藏 GPU，各桌型一個 worker，輸出 `out/web-realtime/v8-arena-3000-parallel-{n}.json`，合併到 `v8-arena-3000.json`。
+  2. **40 BB 與 150 BB**：`web_policy_ab.py --baseline web_preflop_v7.json --candidate web_preflop_v8.json.gz --stack-bb {40,150} --deals 3000 --seed 20261029 --seconds 2`，2–9-max × rule／station；32 個配對 v8−v7 的 95% CI 上界都必須 ≥ 0（不顯著為負）。輸出 `out/web-realtime/v8-paired-{40,150}bb-{n}-3000.json`。註：32 個比較中即使 v8 與 v7 相同，也可能因多重比較有約 0.8 個偽失敗，結果照實記錄、不改門檻。
+  3. 1 與 2 都通過才算 v8 通過；不通過就先分析，不調整門檻。
+- 執行：等 `~/poker` 的 A2–A7 背景配對（web_policy_ab.py）全部結束後自動啟動，避免 CPU 爭用影響 2 秒預算；啟動時把相關檔案 SHA 寫入 `out/web-realtime/v8-eval.manifest.txt`。
+- **v8 驗收結果（2026-10-25 03:59–13:34）：未通過。** 依門檻 3，runtime 不升級，維持 v7 判斷前先分析。
+  1. 100 BB Arena：**通過**固定 gate（2–9-max 完整、逐位置全部通過）。vs rule 2–9-max：+41.34、+18.86、+27.86、+22.28、+6.31、+10.39、+14.68、+10.26 bb/100（6-max CI 跨 0）；vs station 全部顯著為正。報告 `out/web-realtime/v8-arena-3000.json`（由 parallel-2…9 合併，seed／table SHA／config 已斷言）。
+  2. 150 BB 配對：16 組全部不顯著為負（8-max vs rule +7.26 [+0.53,+13.98]、9-max vs rule +8.64 [+0.99,+16.29] 顯著為正）。
+  3. **40 BB 配對：未通過**。vs rule 8 組都不顯著為負；**vs station 3–9-max 全部顯著為負**：−45.41、−41.88、−40.21、−51.65、−46.78、−44.88、−52.50 bb/100（2-max −12.43 [−30.32,+5.47]）。報告 `out/web-realtime/v8-paired-{40,150}bb-{n}-3000.json`。
+  - 初步診斷（6-max vs station 40 BB）：v8 的 VPIP／PFR 只比 v7 低約 0.01–0.04，但每個位置的配對 EV 都為負（CO −81.7、HJ −74.7）；150 BB 時兩者頻率相同、差距不顯著。主要嫌疑是 20–60 BB 的 open 尺寸上限（40 BB 為 2.2 BB，v7 為 2.5／3.0 BB）：對只會跟注的 station，較小的尺寸少拿價值。單一變因診斷見 `out/web-realtime/v8-diag/`（只作診斷，不是驗收）。
+  - 診斷結果（6-max vs station、40 BB、1,000 deals、seed 20261101，相對 v8）：只把 20–60 BB open 尺寸改回 v7 → +17.23 [+7.86,+26.60] bb/100；open 尺寸加上 unopened／vs-open 的深度範圍係數都改回 v7 → +48.63 [+22.86,+74.41]。兩者合計約等於 v8 對 v7 的損失（−51.65），所以損失來自這兩項淺籌碼調整（範圍收窄約占 2/3、較小 open 約占 1/3），不是新增的 vs 3bet／4bet／all-in 節點。對只會跟注的 station，較寬範圍與較大尺寸本來就賺更多；這不代表對會反擊的對手也一樣（40 BB vs rule 這兩項沒有造成顯著差異）。
+  - 若要再驗收，候選 v8.1 = v8 但 unopened／vs-open 的深度係數與 open 尺寸回到 v7（保留 vs 3bet／4bet／5bet／all-in 節點與其深度係數）；必須重新訂門檻後完整重跑，不能沿用本次診斷宣稱通過。
+
+### 翻前 v8.1（使用者要求建立並完整重跑；runtime 預設已指向 v8.1，驗收前不得當作已通過）
+
+- 表：`backend/agents/data/web_preflop_v8_1.json.gz`（version `web-v8.1-depth-allin`），由 `python -m scripts.experiments.web_preflop_v8_tables` 與 v8 一起產生；v8 表重新產生後位元相同。open／limp／option、vs open（含 SB／BB 分流）在每個深度都與 100 BB 表相同（= v7 的寬度與尺寸）；只有 vs 3bet／cold 3bet／vs 4bet／vs 5bet 與 all-in 節點依深度變化。測試 94 passed（v8.1／v8 29、v7 53、API 12）。
+- **v8.1 驗收門檻（2026-10-25 16:30 CST，執行前訂定，不事後調整）**：
+  1. **100 BB**：與 A6／v8 相同的固定 Arena gate（`web_realtime_accept.py --phase arena --deals 3000 --seconds 2`，固定 seed 20261029，2–9-max × rule／station 16 組，`gate(rows, "arena")`，完整覆蓋）。輸出 `out/web-realtime/v81-arena-3000-parallel-{n}.json` → `v81-arena-3000.json`。
+  2. **40 BB 與 150 BB**：`web_policy_ab.py --baseline web_preflop_v7.json --candidate web_preflop_v8_1.json.gz --stack-bb {40,150} --deals 3000 --seconds 2`，2–9-max × rule／station；32 個配對 v8.1−v7 的 95% CI 上界都 ≥ 0。**種子改用新的 20261102**：v8.1 的設計參考了 v8 在 seed 20261029 的結果（診斷用 20261101），沿用同一種子會有選擇偏差。輸出 `out/web-realtime/v81-paired-{40,150}bb-{n}-3000.json`。多重比較下即使無差異也可能約有 0.8 個偽失敗，照實記錄、不改門檻。
+  3. 1 與 2 都通過才算 v8.1 通過並保留為 runtime；不通過則 runtime 回到 v7 並先分析。
+- 執行：以 Windows 隱藏 `wsl.exe` 程序獨立執行（不受 Claude 工作階段結束影響），2-max Arena 用 GPU，其餘隱藏 GPU；manifest `out/web-realtime/v81-eval.manifest.txt`，進度 `out/web-realtime/v81-eval.out`。
+- 移到原本電腦開網頁：在本機 commit 到 `preflop-v8` 後由使用者 `git push -u origin preflop-v8`；原電腦 `git fetch && git switch preflop-v8 && pip install -e ".[web,sim,solver]"`，再照 README「網頁牌桌（M2）」建置前端並啟動 uvicorn。網頁的 `realtime` 座位會自動讀 v8 表；v8 表與 equity 矩陣都在 git 內，不需要 out 資料。
+
+## 暫停檢查點（2026-10-24 19:43 CST；歷史紀錄）
 
 - 使用者要把計算移到另一台電腦；目前評估程序已按 PID 停止。SIGINT 一度被背景程序忽略，之後對各工作 PID 發 SIGTERM。已確認沒有 web_policy_ab.py、web_realtime_accept.py、Arena runner、網路評估、網站 supervisor 或 vite/uvicorn 程序仍在跑。
 - RTX 4060 為 0% 使用，約 639 MiB / 8188 MiB、43°C。網站 supervisor PID 123459 已停止，網站維持停止。
