@@ -44,6 +44,10 @@
   2. **40 BB 與 150 BB**：`web_policy_ab.py --baseline web_preflop_v7.json --candidate web_preflop_v8_1.json.gz --stack-bb {40,150} --deals 3000 --seconds 2`，2–9-max × rule／station；32 個配對 v8.1−v7 的 95% CI 上界都 ≥ 0。**種子改用新的 20261102**：v8.1 的設計參考了 v8 在 seed 20261029 的結果（診斷用 20261101），沿用同一種子會有選擇偏差。輸出 `out/web-realtime/v81-paired-{40,150}bb-{n}-3000.json`。多重比較下即使無差異也可能約有 0.8 個偽失敗，照實記錄、不改門檻。
   3. 1 與 2 都通過才算 v8.1 通過並保留為 runtime；不通過則 runtime 回到 v7 並先分析。
 - 執行：以 Windows 隱藏 `wsl.exe` 程序獨立執行（不受 Claude 工作階段結束影響），2-max Arena 用 GPU，其餘隱藏 GPU；manifest `out/web-realtime/v81-eval.manifest.txt`，進度 `out/web-realtime/v81-eval.out`。
+- **v8.1 驗收結果（2026-10-25 16:28 – 10-26 01:58）：通過**，runtime 保留 v8.1。
+  1. 100 BB Arena：通過固定 gate（2–9-max 完整、逐位置全部通過）。vs rule 2–9-max：+40.57、+18.86、+27.86、+22.28、+6.31、+10.39、+14.68、+10.26 bb/100（6-max CI 跨 0）；vs station 全部顯著為正。3–9-max 與 v8 完全相同（100 BB 起手時兩者的表相同、CPU 路徑確定性）；2-max 為 GPU 求解，數字略有不同。報告 `out/web-realtime/v81-arena-3000.json`。
+  2. 40 BB 與 150 BB 配對（seed 20261102）：32 組全部不顯著為負。顯著為正：40 BB 8-max vs rule +3.33 [+0.91,+5.74]、9-max vs rule +2.69 [+0.38,+5.01]、7-max vs station +7.65 [+0.76,+14.54]；150 BB 9-max vs rule +6.75 [+0.74,+12.76]。v8 失敗的 40 BB vs station 3–9-max 現為 +0.94、−3.74、+0.55、+3.69、+7.65、−3.61、−3.22，都不顯著為負。報告 `out/web-realtime/v81-paired-{40,150}bb-{n}-3000.json`。
+  - 限制：仍是 HEURISTIC 表（非 GTO）；通過只代表對 rule／station 不比 v7 差；20–30 BB 與 50–80 BB 桶、v8.1 新節點的逐位置頻率稽核尚未做；全專案 pytest 與 network_opponents.py 尚未在新電腦跑。
 - 移到原本電腦開網頁：在本機 commit 到 `preflop-v8` 後由使用者 `git push -u origin preflop-v8`；原電腦 `git fetch && git switch preflop-v8 && pip install -e ".[web,sim,solver]"`，再照 README「網頁牌桌（M2）」建置前端並啟動 uvicorn。網頁的 `realtime` 座位會自動讀 v8 表；v8 表與 equity 矩陣都在 git 內，不需要 out 資料。
 
 ## 暫停檢查點（2026-10-24 19:43 CST；歷史紀錄）

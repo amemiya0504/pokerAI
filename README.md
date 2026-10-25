@@ -14,7 +14,7 @@
 | M6 · GTO Dataset Pipeline | ✅ 完成（見下方驗收結果） |
 | M7 · GTO Policy Network | ⚠️ 模仿指標達標，但策略本身仍高度可被剝削（見下方） |
 | 即時求解 Agent · A、B、C 階段 | ✅ M8 對手模型已接入；原 Arena Agent 保持基準路徑 |
-| Web AI 2–9 人 | ✅ v7 通過 3,000-deal Arena gate（2–9-max）；⚠️ 翻前 v8 未通過驗收（40 BB 對 station 3–9-max 顯著為負）；🔄 v8.1（open／vs-open 回到 v7，保留 3bet+／all-in 節點）驗收進行中 |
+| Web AI 2–9 人 | ✅ 翻前 v8.1 通過驗收（100 BB Arena gate；40／150 BB 對 v7 配對 32 組都不顯著為負），為目前 runtime；v8 未通過（40 BB 對 station） |
 | M8 · Opponent Modeling | ✅ 完成（門檻版本 2、新種子重跑通過；版本 1 的結果與原因見下方「M8 驗收結果」） |
 | M9 · Exploit Engine | ⚠️ 精確前置檢查通過；Arena E1 未過、E2 通過（見下方「M9 驗收結果」） |
 | M10 | 未開始 |
@@ -570,6 +570,10 @@ A5 range-source 配對只改 equity 的對手 range 來源：兩組使用同一�
 A6 的 pot-odds 邊界測試與 5–9-max 配對 CPU 診斷已通過；A7 增加後 `tests/test_web_realtime.py` 為 52 passed。全專案最近一次結果是 A7 前的 249 passed（652.34 秒），Arena 結束前尚未重跑全套。v7 全桌 Arena（3,000 deals × 16 組、seed 20261029）已完成並通過固定 gate：對 rule 2–9-max 依序 +41.65、+19.06、+24.48、+19.06、+7.61、+8.07、+10.85、+5.87 bb/100，其中 6、7、9-max 的 95% CI 跨 0（gate 只要求不顯著為負）；對 station 全部顯著為正；逐位置棄牌與 cheap gate 全部通過。報告：`out/web-realtime/a6-arena-v7-3000.json`。M9 的 rule 輸出、門檻、種子未修改。
 
 設計：[`docs/realtime-agent.md`](docs/realtime-agent.md)。M7 的網路策略本身高度可被剝削，所以實際對戰改成**做決策當下對子賽局求解**，網路只當備援。目前只做單挑。
+
+### 翻前 v8.1（目前 runtime；2026-10-26 驗收通過）
+
+`backend/agents/data/web_preflop_v8_1.json.gz`：與 v8 相同的 schema、深度分桶與 vs 3bet／cold 3bet／vs 4bet／vs 5bet／all-in 節點，但 open／limp／option 與 vs open 的範圍和尺寸在每個深度都與 v7 相同（v8 在這兩處的淺籌碼調整是 40 BB 對 station 虧損的原因）。驗收門檻在執行前寫入 `docs/HANDOFF.md`：100 BB 固定 Arena gate 通過；40／150 BB 對 v7 的配對（新種子 20261102）32 組都不顯著為負，其中 4 組顯著為正。仍是 HEURISTIC，不是 GTO。
 
 ### 翻前 v8（深度分桶、vs 3bet／4bet／all-in；2026-10-25 驗收未通過）
 
