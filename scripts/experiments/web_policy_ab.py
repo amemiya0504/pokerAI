@@ -15,8 +15,10 @@ from backend.engine.actions import Action, ActionType
 from backend.agents.style import StyleAgent
 try:
     from . import web_realtime_accept as experiment
+    from .preflop_exploiters import PROBES
 except ImportError:  # Direct ``python scripts/experiments/web_policy_ab.py`` invocation.
     import web_realtime_accept as experiment
+    from preflop_exploiters import PROBES
 
 
 def interval(values: list[float]) -> dict:
@@ -68,6 +70,7 @@ def opponents() -> dict:
     rows = dict(experiment.OPPONENTS)
     rows.update({name: (lambda seed, style=name: StyleAgent(seed, style))
                  for name in ("nit", "tag", "lag", "maniac")})
+    rows.update(PROBES)  # v8.2 gate: iso-raise every limp / squeeze every flat
     return rows
 
 

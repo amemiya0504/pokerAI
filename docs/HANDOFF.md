@@ -47,8 +47,65 @@
 - **v8.1 驗收結果（2026-10-25 16:28 – 10-26 01:58）：通過**，runtime 保留 v8.1。
   1. 100 BB Arena：通過固定 gate（2–9-max 完整、逐位置全部通過）。vs rule 2–9-max：+40.57、+18.86、+27.86、+22.28、+6.31、+10.39、+14.68、+10.26 bb/100（6-max CI 跨 0）；vs station 全部顯著為正。3–9-max 與 v8 完全相同（100 BB 起手時兩者的表相同、CPU 路徑確定性）；2-max 為 GPU 求解，數字略有不同。報告 `out/web-realtime/v81-arena-3000.json`。
   2. 40 BB 與 150 BB 配對（seed 20261102）：32 組全部不顯著為負。顯著為正：40 BB 8-max vs rule +3.33 [+0.91,+5.74]、9-max vs rule +2.69 [+0.38,+5.01]、7-max vs station +7.65 [+0.76,+14.54]；150 BB 9-max vs rule +6.75 [+0.74,+12.76]。v8 失敗的 40 BB vs station 3–9-max 現為 +0.94、−3.74、+0.55、+3.69、+7.65、−3.61、−3.22，都不顯著為負。報告 `out/web-realtime/v81-paired-{40,150}bb-{n}-3000.json`。
-  - 限制：仍是 HEURISTIC 表（非 GTO）；通過只代表對 rule／station 不比 v7 差；20–30 BB 與 50–80 BB 桶、v8.1 新節點的逐位置頻率稽核尚未做；全專案 pytest 與 network_opponents.py 尚未在新電腦跑。
+  - 限制：仍是 HEURISTIC 表（非 GTO）；通過只代表對 rule／station 不比 v7 差；20–30 BB 與 50–80 BB 桶尚未做 EV 配對驗收；頻率稽核、pytest、network_opponents 與 A2–A7 分析見下方「v8.1 後續檢查」。
 - 移到原本電腦開網頁：在本機 commit 到 `preflop-v8` 後由使用者 `git push -u origin preflop-v8`；原電腦 `git fetch && git switch preflop-v8 && pip install -e ".[web,sim,solver]"`，再照 README「網頁牌桌（M2）」建置前端並啟動 uvicorn。網頁的 `realtime` 座位會自動讀 v8 表；v8 表與 equity 矩陣都在 git 內，不需要 out 資料。
+
+### v8.1 後續檢查（2026-10-26）
+
+- **翻前頻率稽核**（只模擬翻前；seed 20261103；每組 3,000 手；2–9 人 × 25／40／60／100／150 BB；自我對打與對 rule；結果 `out/web-realtime/v81-preflop-audit-3000.json`，稽核腳本未入庫）：
+  - 頻率隨深度的方向合理：vs 3bet 的 raise 從 20 BB 的 23% 降到 150 BB 的 10%；open／vs open 在每個深度都相同（= v7）。20／40 BB 的 4bet 會因 `jam_fraction` 0.40 變成全押，所以 vs 4bet 節點只在 ≥ 60 BB 出現。
+  - 167 個「fold 0% 或 100%」旗標中，131 個是 BB 面對 limp（可以免費過牌，fold 0% 是正常的）。
+  - **漏洞 1：limp 後被加注就全部棄牌**（從 v7 就有，v8.1 沿用）。2-max BTN 用 37 類最弱的牌 limp（約 12%）。被 BB 加注到 2.5–4 BB 時，vs open 表對這些牌全部棄牌（每個深度 63–85 次決策，全是 fold）。3–5-max 的 BTN／CO／HJ limp 後遇到 SB／BB 加注也一樣。對「每次 limp 都加注」的對手，這些牌比直接棄牌多輸 0.5 BB；2-max 的損失上限約 3 bb/100（以全部手數計）。
+  - **漏洞 2：平跟後遇到 squeeze 就全部棄牌**。cold_vs_3bet 也用在已經平跟 open 的玩家（例如 4–6-max BTN 平跟後，SB／BB 3bet）。這張表 fold 96–97%，有數格在 30–102 次決策中全部棄牌，會被頻繁 squeeze 剝削。
+  - 兩個漏洞都只在表的設計層面確認，尚未用剝削型對手量化。修正會改變表，等同 v8.2，必須先訂門檻再完整驗收。
+- **對手直接 open 全押**（`vs_allin_*_unopened`，Arena 與自我對打都沒出現過）以探針確認：key 正確（2-max 為 late，6／9-max 第一位為 early）；跟注範圍隨深度收緊、越後位越寬。100 BB 只跟 AA–KK（BB 再加 AKo，0.5–2.6%），40 BB 為 1–5%，20 BB 為 1–17%（2-max BB 36%）。假設的全押範圍很緊，所以面對亂推的對手會少賺；但跟注率仍足以讓任意兩張全押不賺錢（9-max 100 BB 合計約 10% 被跟，被跟時平均輸約 60 BB），不構成可剝削的漏洞。
+- **全專案 pytest**（新電腦首次）：280 passed、2 skipped（前端未 build）、**1 failed**：`tests/test_cfr_games.py::test_leduc_value_and_convergence`。300 次迭代的 NashConv 為 0.01251 > 0.01（期望值 −0.0855 正常）。
+  - 這個結果在任何 PYTHONHASHSEED、numpy 2.1.3／2.2.6／2.3.4／2.5.4 下都相同；`handoff/transfer-20261024` 分支同樣失敗，CFR 程式自 M5 起沒改過，所以不是 v8 造成的。
+  - 舊電腦上一次全套是 249 passed，差異原因未查明。測試與門檻都沒有修改。log 在 `out/full-tests-20261026.log`。
+- **network_opponents.py**（`--deals 2000`，GPU；10-26 03:22–03:43，exit 0）：八個模型的 KL、EV regret、river／turn exploitability 與 vs rule／vs net-mlp 的 bb/100 和 CI，都與舊電腦的 `out/policy/network_opponents.json` 完全相同；只有 CPU p50 延遲較低（1–3 ms，舊電腦 4–10 ms）。結果 `out/policy/network_opponents-20261026.{json,log}`。
+- **A2–A5 的 2–4-max 配對**（seed 20261029、3,000 deals、rule／station；bb/100、95% CI；2-max 各組都不顯著）：
+  - A2−A1、A4−A3：都不顯著。
+  - A3−A2（v3 的 SB／BB 分流）：vs rule 不顯著；**vs station 3-max −62.18 [−84.51,−39.85]、4-max −45.01 [−68.35,−21.68]**，主要來自 BB（3-max −115.7、4-max −87.0）與 4-max CO（−74.1）。v7／v8.1 用的就是 A3 這套分流。
+  - A5（同一張 v3 表，比較 public 與 uniform 對手範圍）：vs rule 3-max +48.41 [+35.83,+61.00]、4-max +54.37 [+39.71,+69.03]；**vs station 3-max −111.21 [−148.67,−73.75]、4-max −120.92 [−166.46,−75.39]**（SB −222.4、−354.8）。runtime 用的是 public range。
+  - 解讀：A3 分流與 public range 對 rule 有利、對 station 不利，表示它們只在「對手範圍會隨行動收窄」的前提下才賺錢；面對只會跟注的對手應改用寬範圍。v7 Arena 對 station 的絕對值仍大幅為正（+379 到 +1650），所以這是少賺，不是輸錢。依觀察到的風格切換 range source，可以交給 M8 對手模型處理，尚未實作。
+- **A7 逐位置**：對 rule 的正值集中在後位（BTN +2.1 到 +8.0、CO +2.2 到 +3.4、HJ +2.4 到 +3.8）；對 nit 在 3–9-max 都為正（7-max 不顯著）。對 station 3-max −1.41 [−2.79,−0.03]、tag 5-max HJ −3.3，對 maniac 與 station 大多為 0。維持預設關閉。
+
+### 翻前 v8.2（修 limp 後全棄與平跟後遇 squeeze 全棄；2026-10-26 驗收未通過，runtime 維持 v8.1）
+
+- 表：`backend/agents/data/web_preflop_v8_2.json.gz`（version `web-v8.2-capped-defence`），由 `python -m scripts.experiments.web_preflop_v8_tables` 與 v8／v8.1 一起產生（v8、v8.1 重新產生後位元相同）。除了新增的兩種 `:mdf` 節點，其他 10,780 張表與 v8.1 完全相同。
+  - `limp_vs_raise`：自己 limp 後面對一次加注（不含全押）。
+  - `flat_vs_squeeze`：自己平跟 open 後面對 3bet。
+  - 兩者都存每手牌在「到達這個節點的範圍」中的百分位（open-limp 範圍，或各 vs-open 表平跟範圍的平均；依對隨機手牌的 equity 排序）。runtime 以 `mdf_scale × MDF × 0.75^(其他仍在局的對手數)` 決定繼續的比例，MDF = 1 − 跟注額／底池；limp 節點 `mdf_scale` 0.75，squeeze 節點 0.60。最強約 2.5% 的牌 re-raise。
+  - 例：HU limp 後被加注到 4 BB，繼續 limp 範圍中最好的 30%（v8.1 為 0%）；6-max BTN 平跟後被 squeeze 到 10 BB，繼續約 22% 的平跟範圍（77、88、ATo、AJo 等），AA 4bet。
+  - 只有表含 `defend_groups` 時才用新節點，所以 v8.1 表在同一份程式下行為不變。
+- 剝削探針 `scripts/experiments/preflop_exploiters.py`（已註冊到 `web_policy_ab.py --opponents`）：`iso` 對每個 limp 用任意兩張牌加注到 4 BB（每多一個 limper 加 1 BB），`squeeze` 對每個被平跟的 open 用任意兩張牌 3bet 到 3 倍 open（每個跟注者再加 1 倍）。其餘行動與翻後都是 RuleBasedAgent。Arena 的 `OPPONENTS` 與 gate 未修改。
+- 測試：`tests/test_web_preflop_v8.py`、`test_web_realtime.py`、`test_api.py` 共 102 passed。
+- **v8.2 驗收門檻（2026-10-26 03:56 CST，執行前訂定，不事後調整）**：
+  1. **100 BB Arena**：與 A6／v8／v8.1 相同的固定 gate（`web_realtime_accept.py --phase arena --deals 3000 --seconds 2`，固定 seed 20261029，2–9-max × rule／station 16 組，`gate(rows, "arena")`，完整覆蓋）。輸出 `out/web-realtime/v82-arena-3000-parallel-{n}.json` → `v82-arena-3000.json`。2-max 用 GPU，等 network_opponents 結束後才開始（一次只跑一個 GPU 工作）。
+  2. **對 rule 配對**：`web_policy_ab.py --baseline web_preflop_v8_1.json.gz --candidate web_preflop_v8_2.json.gz --opponents rule --stack-bb {40,100,150} --deals 3000 --seconds 2 --seed 20261104`，2–9-max；24 組 v8.2−v8.1 的 95% CI 上界都 ≥ 0。station 不納入配對：station 從不加注，新節點不會觸發，兩版行為相同；station 由第 1 項 Arena 檢查。
+  3. **剝削探針配對**：同上但 `--opponents iso squeeze`、100 BB、seed 20261104，2–9-max 共 16 組：每組 v8.2−v8.1 的 95% CI 上界都 ≥ 0，**而且 6-max vs squeeze 的 95% CI 下界 > 0（必須顯著改善），2-max vs iso 的點估計 > 0（方向正確）**。
+     - 修訂紀錄：03:56 初版要求 2-max vs iso 也顯著為正；03:58 在啟動任何 seed 20261104 的執行之前，依檢定力估算改成只要求方向。理由：HU 的 limp 範圍是最弱的牌（Q7o、K2o 一類），面對任意兩張 iso，跟注只比棄牌每次多約 0.6 BB，3,000 deals 預估約 +1 bb/100；而 v8.1 的 2-max 配對 CI 寬約 ±2.2 bb/100，要顯著需約 3 倍手數（2-max 約多 30 小時）。HU 漏洞較根本的修法是不要只用最弱的牌 limp（改 open 表），本版未做。squeeze 節點的平跟範圍是中等牌，每次跟注預估多 4 BB 以上，維持顯著要求。
+  4. 1–3 都通過，v8.2 才保留為 runtime；任一項不通過，runtime 回到 v8.1 並先分析，不調整門檻。第 2、3 項共 40 組，即使兩版真的無差異，也可能有約 1 組偽失敗；照實記錄，不改門檻。
+  - 種子 20261104 未用於設計：v8.2 的參數只看過靜態探針（固定牌局的 lookup），沒有看過任何模擬結果。冒煙測試（只確認流程）用另一個種子 20261105，結果不採計。
+- 執行（10-26 03:59 起）：`run_v82_eval.sh` 以 Windows 隱藏 `wsl.exe` 獨立執行，40 個工作、同時最多 24 個，2-max 先跑；manifest `out/web-realtime/v82-eval.manifest.txt`，進度 `out/web-realtime/v82-eval.out`。輸出：`v82-arena-3000-parallel-{n}.json`、`v82-rule-{40,100,150}bb-{n}-3000.json`、`v82-probes-100bb-{n}-3000.json`。
+- **更正（04:02，啟動後、看任何結果前）**：03:58 修訂的理由「2-max 配對手數加 3 倍要多約 30 小時」是錯的。`web_policy_ab.py` 用 network 模式，2-max 配對約 2 分鐘就跑完；慢的只有用 solver 的 2-max Arena。工作已啟動，所以門檻不再更動（仍以 03:58 版為準）。另跑一組**不採計**的補充檢定：2-max vs iso、12,000 deals、新種子 20261106，輸出 `out/web-realtime/v82-supp-iso-2-12000.json`，只作 HU limp 修正效果的參考。
+- **v8.2 驗收結果（10-26 03:59–04:15）：未通過**。依門檻第 4 項，runtime 改回 v8.1（`web_preflop.TABLE_PATH`），v8.2 的表、程式與測試保留為未通過的候選（同 v8）。判定腳本輸出見下；第 2、3 項已確定不通過，第 1 項不可能改變結論，所以 04:15 停掉尚未跑完的 2-max、5–9-max Arena（3、4-max 已完成，報告留在 `v82-arena-3000-parallel-{3,4}.json`，另有中斷的 5–9 檔案，不採計）。
+  1. 100 BB Arena：未完成（已停止）。
+  2. **對 rule 配對：未通過**。7-max 40 BB −1.76 [−3.04,−0.48]、100 BB −2.36 [−4.25,−0.47] 顯著為負；其餘 22 組不顯著，但點估計幾乎全部為負（−0.2 到 −2.6）。rule 只用強牌加注，對它防守較寬會小輸。
+  3. **剝削探針：未通過**。
+     - 2-max vs iso −7.95 [−17.39,+1.48]（需點估計 > 0）。
+     - 6-max vs squeeze +0.12 [−4.53,+4.78]（需顯著為正）。
+     - 其他：iso 3–9-max 都為正（+1.3 到 +2.3），9-max +2.29 [+0.31,+4.27] 顯著；squeeze 8-max +4.61 [+0.06,+9.16] 顯著，3、4、7-max 為負但不顯著。
+     - 補充檢定（不採計）：2-max vs iso 12,000 deals +1.36 [−1.16,+3.88]。
+  - 分析：
+    1. 多人桌的 limp 修正方向正確（對 iso 普遍為正）。
+    2. HU 的 limp 範圍太弱，跟注與棄牌差不多，看不出改善。
+    3. squeeze 節點沒有預期的大幅改善。可能原因：多人翻後是 heuristic，3bet 底池打得不好；或平跟範圍面對任意兩張 squeeze 的實際 equity 實現率比假設低。這點尚未驗證。
+    4. 對 rule 的小幅損失，代表「固定 MDF 防守」對只用強牌加注的對手是錯的。
+  - 可能的下一步（未做）：
+    - 用 M8 對手模型決定是否啟用防守：只在觀察到對手 iso／squeeze 頻率偏高時才防守，其餘維持 v8.1。
+    - HU 改 open 表，不要只用最弱的牌 limp。
+    - 新一輪都要重新訂門檻與種子。
 
 ## 暫停檢查點（2026-10-24 19:43 CST；歷史紀錄）
 

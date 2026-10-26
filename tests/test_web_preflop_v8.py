@@ -1,4 +1,7 @@
-"""Web preflop v8.1 (runtime) and v8: frozen schema 2, depth buckets, vs 3-bet/4-bet/5-bet/all-in contexts, all-in pricing."""
+"""Web preflop v8.1 (runtime) and v8: frozen schema 2, depth buckets, vs 3-bet/4-bet/5-bet/all-in contexts, all-in pricing.
+
+v8.2 (failed its gate, not runtime) adds the capped-range defence nodes; its tests are at the end of this module.
+"""
 
 import numpy as np
 import pytest
@@ -15,7 +18,9 @@ from backend.engine.hand import HandState, Street
 from backend.solver.hands import CLASS_NAMES, COMBOS
 
 
+DEFAULT_PATH = web_preflop.TABLE_PATH
 V81_PATH = web_preflop.TABLE_PATH.with_name("web_preflop_v8_1.json.gz")
+V82_PATH = web_preflop.TABLE_PATH.with_name("web_preflop_v8_2.json.gz")
 VERSION = "web-v8.1-depth-allin"
 
 
@@ -48,7 +53,7 @@ def test_frozen_v8_and_v81_match_generator_and_cover_every_key():
     from scripts.experiments.web_preflop_v8_tables import VARIANTS, generate, load_equity
 
     data = tables()
-    assert web_preflop.TABLE_PATH == V81_PATH  # runtime default is v8.1
+    assert web_preflop.TABLE_PATH == V81_PATH
     assert data["schema"] == 2 and data["version"] == VERSION
     assert "not GTO" in data["source"]
     assert set(data["tables"]) == expected_keys()
@@ -57,6 +62,8 @@ def test_frozen_v8_and_v81_match_generator_and_cover_every_key():
     assert json.loads(json.dumps(generate(E, W))) == data
     v8 = json.loads(gzip.decompress(VARIANTS["v8"]["path"].read_bytes()))
     assert json.loads(json.dumps(generate(E, W, "v8"))) == v8 and v8["version"] == "web-v8-depth-allin"
+    v82 = json.loads(gzip.decompress(VARIANTS["v8.2"]["path"].read_bytes()))
+    assert json.loads(json.dumps(generate(E, W, "v8.2"))) == v82 and v82["version"] == "web-v8.2-capped-defence"
 
 
 def test_v81_unopened_and_vs_open_match_100bb_at_every_depth():
@@ -250,3 +257,129 @@ def test_v8_open_ranges_are_combo_weighted_like_v7_at_100bb():
             a = np.array(v7[f"{n}/{pos}/open:normal"]["probs"])
             b = np.array(v8[f"{n}/100/{pos}/open:normal"]["probs"])
             assert w @ b[:, 2] == pytest.approx(w @ a[:, 2], abs=.002)
+
+
+# ---------------------------------------------------------------- v8.2 capped-range defence (failed gate)
+
+@pytest.fixture
+def v82(monkeypatch):
+    monkeypatch.setattr(web_preflop, "TABLE_PATH", V82_PATH)
+    tables.cache_clear()
+    return tables()
+
+
+def hu(depth=100):
+    return HandState({0: depth * 100, 1: depth * 100}, 0, 50, 100, Deck(1))
+
+
+def flat_then_squeeze(depth=100):
+    h = table(6, depth)
+    fold_to(h, "CO")
+    h.apply(Action.raise_to(250))       # CO opens
+    h.apply(Action.call())              # BTN flats
+    h.apply(Action.raise_to(1000))      # SB squeezes
+    h.apply(Action.fold())              # BB
+    h.apply(Action.fold())              # CO
+    return h
+
+
+def test_v82_only_adds_defence_nodes_and_runtime_stays_v81(v82):
+    from backend.agents.web_preflop_v8 import DEFEND_GROUPS
+
+    assert DEFAULT_PATH == V81_PATH  # v8.2 failed its 2026-10-26 gate
+    assert v82["version"] == "web-v8.2-capped-defence" and "not GTO" in v82["source"]
+    assert v82["defend_groups"] == list(DEFEND_GROUPS)
+    assert set(v82["tables"]) == expected_keys(defend=True)
+    v81 = web_preflop.json.loads(__import__("gzip").decompress(V81_PATH.read_bytes()))["tables"]
+    assert {k: t for k, t in v82["tables"].items() if not k.endswith(":mdf")} == v81
+
+
+def test_limper_facing_raise_and_flatter_facing_squeeze_contexts(v82):
+    h = hu()
+    h.apply(Action.call())              # BTN/SB limps
+    h.apply(Action.raise_to(400))       # BB isolates
+    v, legal = h.observation(h.to_act), h.legal_actions()
+    assert context(v, legal, defend=True) == "limp_vs_raise:mdf"
+    assert context(v, legal).startswith("vs_open_early_medium:")   # v8.1 tables keep the old node
+    assert lookup(v, legal)[2] == "2/100/BTN/SB/limp_vs_raise:mdf"
+
+    h = flat_then_squeeze()
+    v, legal = h.observation(h.to_act), h.legal_actions()
+    assert context(v, legal, defend=True) == "flat_vs_squeeze:mdf"
+    assert context(v, legal) == "cold_vs_3bet:normal"
+
+    h = table(6)
+    fold_to(h, "CO")
+    h.apply(Action.call())              # CO limps
+    h.apply(Action.raise_to(400))       # BTN isolates
+    h.apply(Action.raise_to(1200))      # SB 3-bets: the limper is cold, not a flatter
+    h.apply(Action.fold())
+    assert context(h.observation(h.to_act), h.legal_actions(), defend=True) == "cold_vs_3bet:normal"
+
+    h = hu()
+    h.apply(Action.call())
+    h.apply(Action.raise_to(10000))     # BB jams over the limp: the all-in node wins
+    assert context(h.observation(h.to_act), h.legal_actions(), defend=True) == "vs_allin_late_unopened:allin"
+
+
+def test_defence_continues_mdf_share_of_the_capped_range(v82):
+    from backend.agents.web_preflop_v8 import DEFEND_SMOOTHING
+
+    h = hu()
+    h.apply(Action.call())
+    h.apply(Action.raise_to(400))
+    v, legal = h.observation(h.to_act), h.legal_actions()
+    probs, t, _ = lookup(v, legal)
+    fraction = t["mdf_scale"] * (1 - legal.call_amount / v.pot)
+    assert fraction == pytest.approx(.75 * .4)
+    cont = 1 / (1 + np.exp(-np.clip((fraction - np.array(t["percentile"])) / DEFEND_SMOOTHING, -60, 60)))
+    np.testing.assert_allclose(1 - probs[:, 0], cont, atol=1e-12)
+    limp = np.array([row[1] for row in v82["tables"]["2/100/BTN/SB/open:normal"]["probs"]])
+    w = np.array([len(c) for c in COMBOS]) * limp
+    assert (w @ cont) / w.sum() == pytest.approx(fraction, abs=.03)   # v8.1 continued with none of it
+
+    v, legal = (h := flat_then_squeeze()).observation(h.to_act), h.legal_actions()
+    probs, _, _ = lookup(v, legal)
+    aa, sevens, trash = (CLASS_NAMES.index(c) for c in ("AA", "77", "72o"))
+    assert probs[aa, 2] > .9 and probs[sevens, 1] > .5 and probs[trash, 0] > .99
+
+
+def test_preflop_probes_attack_capped_ranges():
+    from scripts.experiments.preflop_exploiters import IsoProbe, SqueezeProbe
+
+    h = hu()
+    h.apply(Action.call())
+    assert IsoProbe(0).act(h.observation(h.to_act), h.legal_actions()).action.amount == 400
+
+    h = table(6)
+    fold_to(h, "CO")
+    h.apply(Action.raise_to(250))
+    h.apply(Action.call())
+    assert SqueezeProbe(0).act(h.observation(h.to_act), h.legal_actions()).action.amount == 1000
+
+    h = table(6)                        # nothing to attack: plain rule-based play
+    v, legal = h.observation(h.to_act), h.legal_actions()
+    assert "probe" not in (SqueezeProbe(0).act(v, legal).reason or "")
+    assert "probe" not in (IsoProbe(0).act(v, legal).reason or "")
+
+
+@pytest.mark.parametrize("n", (2, 4, 6, 9))
+def test_v82_preflop_is_legal_against_probes(v82, n):
+    from scripts.experiments.preflop_exploiters import IsoProbe, SqueezeProbe
+
+    hit = set()
+    for depth in (25, 100):
+        for seed in range(12):
+            for probe in (IsoProbe, SqueezeProbe):
+                h = table(n, depth, seed)
+                hero = h.seats[seed % n]
+                agents = {s: (WebRealtimeAgent(seed, mode="network") if s == hero else probe(seed + s)) for s in h.seats}
+                while not h.is_over and h.street is Street.PREFLOP:
+                    v, legal = h.observation(h.to_act), h.legal_actions()
+                    decision = agents[v.seat].act(v, legal)
+                    assert legal.is_legal(decision.action)
+                    if v.seat == hero and decision.reason.startswith("frozen preflop"):
+                        assert decision.reason.startswith("frozen preflop web-v8.2-capped-defence")
+                        hit |= {g for g in ("limp_vs_raise", "flat_vs_squeeze") if g in decision.reason}
+                    h.apply(decision.action)
+    assert hit, "probes should reach at least one defence node"

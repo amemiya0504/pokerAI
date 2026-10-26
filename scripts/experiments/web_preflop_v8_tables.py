@@ -1,7 +1,7 @@
-"""Offline generator for the web's frozen v8 / v8.1 preflop tables (schema 2).
+"""Offline generator for the web's frozen v8 / v8.1 / v8.2 preflop tables (schema 2).
 
     python -m scripts.experiments.web_preflop_v8_tables equity   # one-off: data/preflop/hu_equity_169.npz
-    python -m scripts.experiments.web_preflop_v8_tables          # writes the v8 and v8.1 .json.gz tables
+    python -m scripts.experiments.web_preflop_v8_tables          # writes the v8, v8.1 and v8.2 .json.gz tables
 
 Non-all-in nodes reuse the v7 width calibration with per-depth multipliers (HEURISTIC). All-in nodes
 store each hand's equity against an assumed jam range, computed from the 169x169 class equity matrix
@@ -10,6 +10,10 @@ with card-removal weights; the runtime compares it with the actual price.
 v8 failed its 40 BB gate vs station because of its short-stack open sizes and unopened / vs-open range
 multipliers; v8.1 keeps v7's sizes and ranges there at every depth and keeps the new 3-bet / 4-bet /
 5-bet / all-in nodes.
+
+v8.2 = v8.1 plus capped-range defence nodes: v7's limp ranges are the weakest hands and its vs-open
+tables fold all of them to an iso-raise; a flatter facing a squeeze used the cold 3-bet table and
+folded nearly every flat. The new nodes rank each hand within the range that reached the node.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from backend.agents.web_preflop import POSITIONS
-from backend.agents.web_preflop_v8 import (ALLIN_GROUPS, DEPTHS, SCHEMA, groups_for, side)
+from backend.agents.web_preflop_v8 import (ALLIN_GROUPS, DEFEND_GROUPS, DEPTHS, SCHEMA, groups_for, side)
 from backend.dataset.spots import CLASS_ORDER
 from backend.solver.hands import CLASS_NAMES, COMBOS
 from scripts.experiments.web_preflop_tables import BB_DEFENDS, WIDTHS, opener_position_factor
@@ -46,6 +50,10 @@ OPEN_CAP = {20: 2.0, 40: 2.2, 60: 2.3, 100: 99, 150: 99}
 JAM_100 = {"unopened": .025, "after_open": .045, "after_3bet": .06, "cold": .03}
 JAM_20 = {"after_open": .16, "after_3bet": .22, "cold": .10}  # "unopened" uses the jammer's open width
 LATE_JAM = 1.35
+# v8.2 defence: share of MDF this player defends, and the re-raise width (fraction of all combos).
+# shortcut: hand-set; replace with solver frequencies for capped ranges.
+DEFEND_SCALE = {"limp_vs_raise": .75, "flat_vs_squeeze": .60}
+DEFEND_RAISE_WIDTH = .025
 _FLAT = {d: (1, 1) for d in DEPTHS}
 VARIANTS = {
     "v8": {"path": V8_PATH, "version": "web-v8-depth-allin", "depth_adj": DEPTH_ADJ, "open_cap": OPEN_CAP,
@@ -57,6 +65,10 @@ VARIANTS = {
                         "per-depth multipliers only on vs 3-bet/4-bet/5-bet nodes; all-in nodes from class equity "
                         "vs assumed jam ranges; not GTO")},
 }
+VARIANTS["v8.2"] = {**VARIANTS["v8.1"], "path": Path("backend/agents/data/web_preflop_v8_2.json.gz"),
+                    "version": "web-v8.2-capped-defence", "defend": True,
+                    "source": VARIANTS["v8.1"]["source"].removesuffix("; not GTO")
+                    + "; limper-vs-raise and flatter-vs-squeeze nodes defend an MDF share of the capped range; not GTO"}
 
 
 def ranks() -> list[float]:
@@ -140,7 +152,7 @@ def sizing(n: int, pos: str, group: str, depth: int, open_cap: dict) -> dict:
         multiple = 3.5 if pos in ("SB", "BB") else 3.0
     elif "3bet" in group:
         multiple = 2.3
-    elif group.startswith(("vs_4bet", "vs_5bet")):
+    elif group.startswith(("vs_4bet", "vs_5bet")) or group == "flat_vs_squeeze":
         multiple = 2.2
     else:
         multiple = 3.5 if pos in ("SB", "BB") else 3.0
@@ -188,6 +200,34 @@ def allin_table(rank, E, W, n, depth, group) -> dict:
                               "jam range is HEURISTIC, multiway is approximated")}
 
 
+def defend_table(rank, strength, n, pos, group, depth, open_cap, arrival: np.ndarray) -> dict:
+    """Percentile of each hand within the arrival range (0 = best), combo-weighted by equity vs a random hand."""
+    w = np.array([len(c) for c in COMBOS]) * arrival
+    total, before, percentile = max(float(w.sum()), 1e-12), 0.0, [0.0] * 169
+    for ci in sorted(range(169), key=lambda c: -strength[c]):
+        percentile[ci] = round(min(1.0, (before + w[ci] / 2) / total), 4)
+        before += w[ci]
+    return {**sizing(n, pos, group, depth, open_cap), "percentile": percentile,
+            "raise": [round(smooth(rank[ci], DEFEND_RAISE_WIDTH, .008), 4) for ci in range(169)],
+            "mdf_scale": DEFEND_SCALE[group],
+            "decision_note": ("capped-range node: continue with the best mdf_scale x MDF share of the range that "
+                              "reached it; HEURISTIC")}
+
+
+def arrival_range(tables: dict, prefix: str, group: str) -> np.ndarray:
+    """Passive-action weights that bring a hand to the node: an open-limp, or a flat of any open.
+
+    shortcut: over-limpers use the open-limp ranking too (their stronger hands rank as top of range).
+    """
+    passive = lambda g: np.array([row[1] for row in tables[f"{prefix}/{g}:normal"]["probs"]])
+    if group == "limp_vs_raise":
+        return passive("open")
+    opens = [k.removeprefix(prefix + "/").removesuffix(":normal") for k in tables
+             if k.startswith(prefix + "/") and k.endswith(":normal")
+             and k.removeprefix(prefix + "/").startswith(("vs_open", "sb_vs_open", "bb_vs_open"))]
+    return np.mean([passive(g) for g in opens], axis=0)
+
+
 def generate(E: np.ndarray, W: np.ndarray, variant: str = "v8.1") -> dict:
     v = VARIANTS[variant]
     rank = ranks()
@@ -195,6 +235,9 @@ def generate(E: np.ndarray, W: np.ndarray, variant: str = "v8.1") -> dict:
             "depths_bb": list(DEPTHS),
             "stack_note": "effective-stack buckets <30, <50, <80, <125, >=125 BB; solved 5–20 BB push/fold cells take precedence",
             "actions": ["fold", "passive", "raise"], "hands": list(CLASS_NAMES), "tables": {}}
+    if v.get("defend"):
+        data["defend_groups"] = list(DEFEND_GROUPS)
+        strength = (E * W).sum(axis=1) / W.sum(axis=1)  # HU equity vs a random hand
     for n, positions in POSITIONS.items():
         for depth in DEPTHS:
             allin = {g: allin_table(rank, E, W, n, depth, g) for g in ALLIN_GROUPS}
@@ -206,6 +249,10 @@ def generate(E: np.ndarray, W: np.ndarray, variant: str = "v8.1") -> dict:
                         data["tables"][f"{n}/{depth}/{pos}/{group}:{price}"] = table
                 for group, table in allin.items():
                     data["tables"][f"{n}/{depth}/{pos}/{group}:allin"] = table
+                for group in (DEFEND_GROUPS if v.get("defend") else ()):
+                    prefix = f"{n}/{depth}/{pos}"
+                    data["tables"][f"{prefix}/{group}:mdf"] = defend_table(
+                        rank, strength, n, pos, group, depth, v["open_cap"], arrival_range(data["tables"], prefix, group))
     return data
 
 

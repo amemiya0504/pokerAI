@@ -575,6 +575,12 @@ A6 的 pot-odds 邊界測試與 5–9-max 配對 CPU 診斷已通過；A7 增加
 
 `backend/agents/data/web_preflop_v8_1.json.gz`：與 v8 相同的 schema、深度分桶與 vs 3bet／cold 3bet／vs 4bet／vs 5bet／all-in 節點，但 open／limp／option 與 vs open 的範圍和尺寸在每個深度都與 v7 相同（v8 在這兩處的淺籌碼調整是 40 BB 對 station 虧損的原因）。驗收門檻在執行前寫入 `docs/HANDOFF.md`：100 BB 固定 Arena gate 通過；40／150 BB 對 v7 的配對（新種子 20261102）32 組都不顯著為負，其中 4 組顯著為正。仍是 HEURISTIC，不是 GTO。
 
+已知問題（2026-10-26 稽核，尚未修正，詳見 `docs/HANDOFF.md`「v8.1 後續檢查」）：limp 後被加注時一律棄牌（從 v7 沿用，2–5-max）；平跟 open 後遇到 squeeze 時幾乎一律棄牌（cold_vs_3bet）。另外，v3 的 SB／BB 分流與 public 對手範圍在 3–4-max 對 station 比舊版少賺（配對 −45 到 −121 bb/100），對 rule 則較好。全專案 pytest 在新電腦有 1 項舊的 Leduc 收斂測試失敗（300 次迭代 NashConv 0.0125 > 0.01），與 v8 無關。
+
+### 翻前 v8.2（2026-10-26 驗收未通過，不是 runtime）
+
+`backend/agents/data/web_preflop_v8_2.json.gz`：v8.1 加上兩個依「到達範圍」防守的節點（limp 後被加注、平跟後被 squeeze）。對每次都 iso／squeeze 的剝削探針，多人桌 iso 有改善，但 2-max iso 與 6-max squeeze 沒有達到門檻；對 rule 在 7-max 40／100 BB 顯著為負。runtime 維持 v8.1。剝削探針在 `scripts/experiments/preflop_exploiters.py`（`web_policy_ab.py --opponents iso squeeze`）。
+
 ### 翻前 v8（深度分桶、vs 3bet／4bet／all-in；2026-10-25 驗收未通過）
 
 **驗收（門檻在執行前訂定）**：100 BB 固定 Arena gate 通過；150 BB v8−v7 配對 16 組都不顯著為負；40 BB 配對對 rule 8 組都不顯著為負，但**對 station 3–9-max 全部顯著為負（約 −40～−52 bb/100）**，所以 v8 未通過，不取代 v7。詳細數字與診斷見 `docs/HANDOFF.md`。
