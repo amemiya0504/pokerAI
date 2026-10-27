@@ -42,6 +42,38 @@ uvicorn --factory backend.api.app:create_app
 
 開發前端時可另開 `npm run dev`（Vite 會把 `/api` 與 `/ws` 轉給 :8000）。
 
+### AI 決策 API（`/api/ai`）
+
+和網頁牌桌同一個伺服器，用的也是網頁目前的 AI（`WebRealtimeAgent`：v8.2 翻前表＋A8.3 `adaptive`；單挑翻後即時求解，多人翻後用 HEURISTIC）。你可以問任何 2–9 人牌局的決策，並在手牌結束後記錄下來；session 會依 `player_id` 累積每位玩家的對手模型（M8 統計＋A8.3 iso／squeeze 次數），之後的決策會用更新後的範圍。模型完全由已記錄的手牌推導，刪除某一手就會用其餘手牌重建。Session 以 JSON 存在 `POKER_AI_DIR`（預設 `ai_sessions/`），重啟後會重建模型。互動文件：http://127.0.0.1:8000/docs 。
+
+| 方法 | 路徑 | 用途 |
+|---|---|---|
+| POST | `/api/ai/sessions` | 建立 session：`seconds`（單挑翻後每步求解秒數，預設 10）、`mode`、`adaptive`、`multiway_bluff`、`seed`、`name` |
+| GET | `/api/ai/sessions`、`/api/ai/sessions/{id}` | 列出／查看 session |
+| POST | `/api/ai/sessions/{id}/decide` | 取得 AI 決策：動作、各動作機率、理由、合法動作 |
+| POST | `/api/ai/sessions/{id}/hands` | 記錄已結束的手牌，並更新所有參與者的模型 |
+| GET／DELETE | `/api/ai/sessions/{id}/hands[/{hand_no}]` | 列出、查看、刪除手牌（刪除後重建模型） |
+| GET | `/api/ai/sessions/{id}/players[/{player_id}]` | 各玩家的摘要統計；單一玩家會列出所有情境的後驗平均與 90% 區間 |
+
+牌局的寫法：盲注、`button`、`players`（`seat`、`player_id`、開局籌碼），`board` 和 `actions` 從開局寫到目前為止。`actions` 每個元素是 `{"type": "fold|check|call|bet|raise", "amount": 加注到的總額}`，`seat` 可省略（若給了會檢查）。只需要提供有人知道的牌：`decide` 給 AI 自己的 `hole_cards`；`hands` 用 `known_cards` 提供 AI 的牌，以及攤牌時亮出的牌（每個進入攤牌的座位都必須提供）。引擎會依序重播並檢查合法性；不合法的牌局回傳 422，還沒輪到 AI 則回傳 409。
+
+```bash
+curl -X POST localhost:8000/api/ai/sessions -H 'content-type: application/json' -d '{"seconds": 2}'
+curl -X POST localhost:8000/api/ai/sessions/<id>/decide -H 'content-type: application/json' -d '{
+  "hand_id": "h1", "small_blind": 50, "big_blind": 100, "button": 0,
+  "players": [{"seat": 0, "player_id": "ai", "stack": 10000}, {"seat": 1, "player_id": "bob", "stack": 10000}],
+  "hero_seat": 0, "hole_cards": "AhQd", "board": "Qs7c2h",
+  "actions": [{"type": "raise", "amount": 250}, {"type": "call"}, {"type": "check"}]}'
+# 手牌結束後：同樣的欄位，加上完整的 actions 與 "known_cards": {"0": "AhQd"}
+curl -X POST localhost:8000/api/ai/sessions/<id>/hands -H 'content-type: application/json' -d '{...}'
+```
+
+注意事項：
+- 同一手的每次 `decide` 都帶相同的 `hand_id`，AI 才會保留這手內的記憶（自己的範圍更新、safe re-solving），就像在網頁牌桌上。回應的 `in_hand_memory` 會說明是否沿用；如果實際動作和 AI 回傳的不同，會改用新的 agent。
+- 決策一次只處理一個，因為同時跑多個 GPU 求解會讓顯存溢出。
+- 只支援盲注，不支援 ante 和 straddle。
+- M9 的剝削在網頁 AI 中是停用的：它的參考模型是用舊的翻前策略建立的。這裡的對手模型只用於範圍追蹤和 A8.3 防守。
+
 ### 測試
 
 ```bash
@@ -162,6 +194,7 @@ backend/
   db/                # SQLAlchemy 2 模型、Alembic 遷移、存取函式
   api/
     app.py           # FastAPI：REST（牌桌、歷史）+ 每張牌桌一條 WebSocket
+    ai.py            # AI 決策 API：任意牌局的決策、記錄手牌、依 player_id 累積對手模型
     sessions.py      # GameSession：牌桌狀態、AI 行動迴圈、存檔、重啟後恢復
     views.py         # 送給瀏覽器的 JSON，只從 PlayerView 產生
   cli.py             # CLI 示範

@@ -1,6 +1,8 @@
 """FastAPI app: REST for games and history, a websocket per live game.
 
-    uvicorn --factory backend.api.app:create_app   # uses POKER_DB_URL, POKER_AI_DELAY
+    uvicorn --factory backend.api.app:create_app   # uses POKER_DB_URL, POKER_AI_DELAY, POKER_AI_DIR
+
+The AI decision API (`/api/ai`, `backend.api.ai`) keeps its sessions as JSON files in POKER_AI_DIR.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from backend.db.repository import create_game, players_by_id, replay_hand
 from backend.engine.cards import Deck, cards_str
 from backend.engine.hand import HandState
 
+from .ai import make_router
 from .sessions import GameSession
 from .views import view_json
 
@@ -46,7 +49,7 @@ class CreateGame(BaseModel):
 
 
 def create_app(db_url: str | None = None, *, ai_delay: float | None = None,
-               static_dir: Path | None = FRONTEND_DIST) -> FastAPI:
+               static_dir: Path | None = FRONTEND_DIST, ai_dir: Path | str | None = None) -> FastAPI:
     db_url = db_url or os.environ.get("POKER_DB_URL", "sqlite:///poker.db")
     if ai_delay is None:
         ai_delay = float(os.environ.get("POKER_AI_DELAY", "0.6"))
@@ -55,6 +58,7 @@ def create_app(db_url: str | None = None, *, ai_delay: float | None = None,
     live: dict[int, GameSession] = {}
 
     app = FastAPI(title="Poker AI")
+    app.include_router(make_router(ai_dir))
 
     live_lock = threading.Lock()  # sync routes run in a threadpool
 
