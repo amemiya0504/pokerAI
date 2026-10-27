@@ -95,6 +95,8 @@ def main() -> None:
     parser.add_argument("--persistent-models", action="store_true",
                         help="hero keeps its opponent models across hands, as in a web session")
     parser.add_argument("--candidate-adaptive", action="store_true", help="A8.1 style adaptation for the candidate")
+    parser.add_argument("--baseline-adaptive", action="store_true",
+                        help="the same adaptation for the baseline (compare against the A8.3 web runtime)")
     parser.add_argument("--candidate-station-ranges", action="store_true",
                         help="with --candidate-adaptive: also A8's station range switch (reproduces A8)")
     args = parser.parse_args()
@@ -121,6 +123,8 @@ def main() -> None:
         config["persistent_models"] = True
     if args.candidate_adaptive:
         config["candidate_adaptive"] = True
+    if args.baseline_adaptive:
+        config["baseline_adaptive"] = True
     if args.candidate_station_ranges:
         config["candidate_station_ranges"] = True
     out = Path(args.out)
@@ -161,8 +165,10 @@ def main() -> None:
                                                  log=lambda message, **kwargs: print(f"{label} {message}", **kwargs),
                                                  capture_samples=True, multiway_bluff=multiway_bluff,
                                                  stack_bb=args.stack_bb, persistent_models=args.persistent_models,
-                                                 adaptive=args.candidate_adaptive and label == args.candidate_label,
-                                                 station_ranges=args.candidate_station_ranges)
+                                                 adaptive=(args.candidate_adaptive if label == args.candidate_label
+                                                           else args.baseline_adaptive),
+                                                 station_ranges=(args.candidate_station_ranges
+                                                                 and label == args.candidate_label))
                     variants[label] = result
                 baseline, candidate = variants[args.baseline_label], variants[args.candidate_label]
                 deltas = {"overall": paired_delta(baseline["_samples"]["profit"],

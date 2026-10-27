@@ -14,7 +14,7 @@
 | M6 · GTO Dataset Pipeline | ✅ 完成（見下方驗收結果） |
 | M7 · GTO Policy Network | ⚠️ 模仿指標達標，但策略本身仍高度可被剝削（見下方） |
 | 即時求解 Agent · A、B、C 階段 | ✅ M8 對手模型已接入；原 Arena Agent 保持基準路徑 |
-| Web AI 2–9 人 | ✅ 翻前 v8.1 通過驗收（100 BB Arena gate；40／150 BB 對 v7 配對 32 組都不顯著為負）；A8.3 依對手啟用 v8.2 防守通過驗收（2026-10-27），目前 runtime 是 v8.2 表＋網頁 session `adaptive=True`；v8 未通過（40 BB 對 station） |
+| Web AI 2–9 人 | ✅ 翻前 v8.1 通過驗收（100 BB Arena gate；40／150 BB 對 v7 配對 32 組都不顯著為負）；A8.3 依對手啟用 v8.2 防守通過驗收（2026-10-27）；v8.3 面對加注看實際賠率、AA／KK／QQ 不棄牌通過驗收（2026-10-27），目前 runtime 是 v8.3 表＋網頁 session `adaptive=True`；v8 未通過（40 BB 對 station） |
 | M8 · Opponent Modeling | ✅ 完成（門檻版本 2、新種子重跑通過；版本 1 的結果與原因見下方「M8 驗收結果」） |
 | M9 · Exploit Engine | ⚠️ 精確前置檢查通過；Arena E1 未過、E2 通過（見下方「M9 驗收結果」） |
 | M10 | 未開始 |
@@ -44,7 +44,7 @@ uvicorn --factory backend.api.app:create_app
 
 ### AI 決策 API（`/api/ai`）
 
-和網頁牌桌同一個伺服器，用的也是網頁目前的 AI（`WebRealtimeAgent`：v8.2 翻前表＋A8.3 `adaptive`；單挑翻後即時求解，多人翻後用 HEURISTIC）。你可以問任何 2–9 人牌局的決策，並在手牌結束後記錄下來；session 會依 `player_id` 累積每位玩家的對手模型（M8 統計＋A8.3 iso／squeeze 次數），之後的決策會用更新後的範圍。模型完全由已記錄的手牌推導，刪除某一手就會用其餘手牌重建。Session 以 JSON 存在 `POKER_AI_DIR`（預設 `ai_sessions/`），重啟後會重建模型。互動文件：http://127.0.0.1:8000/docs 。
+和網頁牌桌同一個伺服器，用的也是網頁目前的 AI（`WebRealtimeAgent`：v8.3 翻前表＋A8.3 `adaptive`；單挑翻後即時求解，多人翻後用 HEURISTIC）。你可以問任何 2–9 人牌局的決策，並在手牌結束後記錄下來；session 會依 `player_id` 累積每位玩家的對手模型（M8 統計＋A8.3 iso／squeeze 次數），之後的決策會用更新後的範圍。模型完全由已記錄的手牌推導，刪除某一手就會用其餘手牌重建。Session 以 JSON 存在 `POKER_AI_DIR`（預設 `ai_sessions/`），重啟後會重建模型。互動文件：http://127.0.0.1:8000/docs 。
 
 | 方法 | 路徑 | 用途 |
 |---|---|---|
@@ -604,7 +604,16 @@ A6 的 pot-odds 邊界測試與 5–9-max 配對 CPU 診斷已通過；A7 增加
 
 設計：[`docs/realtime-agent.md`](docs/realtime-agent.md)。M7 的網路策略本身高度可被剝削，所以實際對戰改成**做決策當下對子賽局求解**，網路只當備援。目前只做單挑。
 
-### 翻前 v8.1（2026-10-26 驗收通過；目前 runtime 是 v8.2 表，沒有觸發防守時與 v8.1 完全相同，見「A8.3」）
+### 翻前 v8.3 面對加注看實際賠率（2026-10-27 驗收通過，目前 runtime）
+
+`backend/agents/data/web_preflop_v8_3.json.gz`：v8.2 只改面對加注的節點（vs 3bet、cold 3bet、vs 4bet、vs 5bet），其他表完全相同。起因是網頁第 29 手：HJ 用 QQ 開池，面對最小 3bet 只需補 200 進 1,350 的底池卻棄牌。v8.2 的平滑讓這些窄節點連 AA 都有棄牌機率（cold 3bet 平均 24%），而且不分價格。
+
+- AA、KK、QQ 與繼續範圍中較強的一半，在加注節點一律不棄牌。
+- 每手牌另存對「假設的加注者範圍」的 equity；runtime 在 `0.70 × equity ≥ 價格 + 0.03 × 後面還沒行動的人數` 時也跟注，只會放寬、不會比表更緊。面對最小 3bet，HJ 的 open 範圍全部繼續（v8.2 只有 33%）；3 倍 3bet 41%（v8.2 33%）。
+
+驗收（新種子 20261112，事先訂門檻，對照 v8.2＋A8.3、兩邊都 adaptive）：100 BB 2–9-max × 9 種對手（含新的剝削探針 `minraise`：用任意兩張牌最小再加注）72 組，以及 40／150 BB 對 rule／lag 32 組，全部沒有顯著為負；minraise 合併 +59.66 bb/100 [+55.02,+64.29]。對 lag、maniac、tag 多數桌型顯著為正，對 rule 沒有可量測的差異，對 station 完全相同。限制：0.70 的實現率與假設的加注者範圍是捷徑，不是求解結果；只驗模擬對手；固定 Arena 沒有重跑。
+
+### 翻前 v8.1（2026-10-26 驗收通過；目前 runtime 是 v8.3 表，見「翻前 v8.3」與「A8.3」）
 
 `backend/agents/data/web_preflop_v8_1.json.gz`：與 v8 相同的 schema、深度分桶與 vs 3bet／cold 3bet／vs 4bet／vs 5bet／all-in 節點，但 open／limp／option 與 vs open 的範圍和尺寸在每個深度都與 v7 相同（v8 在這兩處的淺籌碼調整是 40 BB 對 station 虧損的原因）。驗收門檻在執行前寫入 `docs/HANDOFF.md`：100 BB 固定 Arena gate 通過；40／150 BB 對 v7 的配對（新種子 20261102）32 組都不顯著為負，其中 4 組顯著為正。仍是 HEURISTIC，不是 GTO。
 
@@ -626,7 +635,7 @@ A8.1 拿掉 station 範圍切換（移到預設關閉的 `station_ranges=True`�
 
 `lookup` 改成只有 `defend=True` 時才用 v8.2 防守節點，範圍估計一律用 v8.1 節點；沒有 adaptive 時載入 v8.2 表也與 v8.1 完全相同。新種子 20261110 驗收：對 station、nit 完全相同，iso＋squeeze 合併 +1.67 bb/100 [+1.06,+2.28]，但 lag 6-max −0.15 [−0.25,−0.05]（3000 deals 中 14 個 deal 有差異、全部為負），所以依門檻沒有啟用。
 
-### A8.3 只在沒人跟注加注時防守（2026-10-27 驗收通過，目前 runtime）
+### A8.3 只在沒人跟注加注時防守（2026-10-27 驗收通過；runtime 仍啟用，翻前表已換成 v8.3）
 
 網頁 session 的 AI 現在是 `WebRealtimeAgent(adaptive=True)`，讀 v8.2 表。同一個 session 中，如果某個對手被觀察到常 iso（limp 後加注）或常 squeeze（至少 8 次機會、比例 ≥ 50%），而且他這次加注後還沒有人跟注，AI 才用 v8.2 的 capped-range 防守節點；其他情況（包括範圍估計）都與 v8.1 完全相同。
 

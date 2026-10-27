@@ -1,7 +1,7 @@
-"""Offline generator for the web's frozen v8 / v8.1 / v8.2 preflop tables (schema 2).
+"""Offline generator for the web's frozen v8 / v8.1 / v8.2 / v8.3 preflop tables (schema 2).
 
     python -m scripts.experiments.web_preflop_v8_tables equity   # one-off: data/preflop/hu_equity_169.npz
-    python -m scripts.experiments.web_preflop_v8_tables          # writes the v8, v8.1 and v8.2 .json.gz tables
+    python -m scripts.experiments.web_preflop_v8_tables          # writes the v8, v8.1, v8.2 and v8.3 .json.gz tables
 
 Non-all-in nodes reuse the v7 width calibration with per-depth multipliers (HEURISTIC). All-in nodes
 store each hand's equity against an assumed jam range, computed from the 169x169 class equity matrix
@@ -14,6 +14,12 @@ multipliers; v8.1 keeps v7's sizes and ranges there at every depth and keeps the
 v8.2 = v8.1 plus capped-range defence nodes: v7's limp ranges are the weakest hands and its vs-open
 tables fold all of them to an iso-raise; a flatter facing a squeeze used the cold 3-bet table and
 folded nearly every flat. The new nodes rank each hand within the range that reached the node.
+
+v8.3 = v8.2 with two fixes to the vs 3-bet / cold 3-bet / vs 4-bet / vs 5-bet nodes. Their continuing
+ranges are narrow next to the logistic smoothing width, so even AA folded 4–31% of the time; now AA, KK,
+QQ and the stronger half of each continuing range never fold. They also ignored the price (a min 3-bet used the
+same row as a 3x one); now they store each hand's equity vs an assumed raiser range and the runtime
+also continues when that equity, discounted for realisation, covers the actual price.
 """
 
 from __future__ import annotations
@@ -27,7 +33,8 @@ from pathlib import Path
 import numpy as np
 
 from backend.agents.web_preflop import POSITIONS
-from backend.agents.web_preflop_v8 import (ALLIN_GROUPS, DEFEND_GROUPS, DEPTHS, SCHEMA, groups_for, side)
+from backend.agents.web_preflop_v8 import (ALLIN_GROUPS, DEFEND_GROUPS, DEPTHS, RAISE_GROUPS, SCHEMA, groups_for,
+                                          side)
 from backend.dataset.spots import CLASS_ORDER
 from backend.solver.hands import CLASS_NAMES, COMBOS
 from scripts.experiments.web_preflop_tables import BB_DEFENDS, WIDTHS, opener_position_factor
@@ -54,6 +61,14 @@ LATE_JAM = 1.35
 # shortcut: hand-set; replace with solver frequencies for capped ranges.
 DEFEND_SCALE = {"limp_vs_raise": .75, "flat_vs_squeeze": .60}
 DEFEND_RAISE_WIDTH = .025
+# v8.3 priced raise nodes: raiser range width (fraction of combos) at 100 BB per node kind, scaled by the
+# depth raise-width multiplier of the node the raiser acted in and by LATE_JAM for a late raiser.
+# shortcut: hand-set; replace with the ranges opponents are observed to raise with.
+RAISER_100 = {"vs_3bet": .08, "cold_vs_3bet": .06, "vs_4bet": .035, "vs_4bet_cold": .035, "vs_5bet": .025}
+RAISER_FAMILY = {"vs_3bet": "vs_open", "cold_vs_3bet": "vs_open", "vs_4bet": "vs_3bet",
+                 "vs_4bet_cold": "vs_3bet", "vs_5bet": "vs_4bet"}
+# v8.3 raise nodes never fold AA, KK, QQ (this share of combos), nor the stronger half of the continuing range.
+PREMIUM_SHARE = 18 / 1326
 _FLAT = {d: (1, 1) for d in DEPTHS}
 VARIANTS = {
     "v8": {"path": V8_PATH, "version": "web-v8-depth-allin", "depth_adj": DEPTH_ADJ, "open_cap": OPEN_CAP,
@@ -69,6 +84,11 @@ VARIANTS["v8.2"] = {**VARIANTS["v8.1"], "path": Path("backend/agents/data/web_pr
                     "version": "web-v8.2-capped-defence", "defend": True,
                     "source": VARIANTS["v8.1"]["source"].removesuffix("; not GTO")
                     + "; limper-vs-raise and flatter-vs-squeeze nodes defend an MDF share of the capped range; not GTO"}
+VARIANTS["v8.3"] = {**VARIANTS["v8.2"], "path": Path("backend/agents/data/web_preflop_v8_3.json.gz"),
+                    "version": "web-v8.3-priced-raises", "priced_raises": True,
+                    "source": VARIANTS["v8.2"]["source"].removesuffix("; not GTO")
+                    + ("; vs 3-bet/4-bet/5-bet nodes never fold the stronger half of their continuing range and also "
+                       "continue when equity vs an assumed raiser range covers the actual price; not GTO")}
 
 
 def ranks() -> list[float]:
@@ -159,7 +179,7 @@ def sizing(n: int, pos: str, group: str, depth: int, open_cap: dict) -> dict:
     return {"raise_bb": raise_bb, "raise_multiple": multiple, "jam_fraction": JAM_FRACTION}
 
 
-def heuristic_table(rank, n, pos, group, depth, depth_adj: dict, open_cap: dict) -> dict:
+def heuristic_table(rank, n, pos, group, depth, depth_adj: dict, open_cap: dict, top_never_folds: bool = False) -> dict:
     defend, raise_width, family = base_widths(n, pos, group)
     dm, rm = depth_adj[family][depth]
     defend = min(1, defend * dm)
@@ -167,6 +187,8 @@ def heuristic_table(rank, n, pos, group, depth, depth_adj: dict, open_cap: dict)
     probs = []
     for ci in range(169):
         continuing = smooth(rank[ci], defend, .025)
+        if top_never_folds and rank[ci] <= max(defend / 2, PREMIUM_SHARE):
+            continuing = 1.0
         raising = min(smooth(rank[ci], raise_width, .018), continuing)
         fold, raising = round(1 - continuing, 4), round(raising, 4)
         probs.append([fold, round(1 - fold - raising, 4), raising])
@@ -188,16 +210,34 @@ def jam_width(n: int, depth: int, jammer_side: str, state: str) -> float:
     return min(.6, width)
 
 
+def range_equity(rank, E, W, width: float) -> list[float]:
+    """Each class's equity vs the top ``width`` of combos (smoothed), with card-removal weights."""
+    opp = np.array([smooth(rank[j], width, .025) for j in range(169)])
+    mass = W * opp[None, :]
+    equity = (E * mass).sum(axis=1) / np.maximum(mass.sum(axis=1), 1e-12)
+    return [round(float(x), 4) for x in equity]
+
+
 def allin_table(rank, E, W, n, depth, group) -> dict:
     _, _, jammer_side, *state = group.split("_")
     state = "_".join(state)
     width = jam_width(n, depth, jammer_side, state)
-    jam = np.array([smooth(rank[j], width, .025) for j in range(169)])
-    mass = W * jam[None, :]
-    equity = (E * mass).sum(axis=1) / np.maximum(mass.sum(axis=1), 1e-12)
-    return {"equity": [round(float(x), 4) for x in equity], "jam_width": round(width, 4),
+    return {"equity": range_equity(rank, E, W, width), "jam_width": round(width, 4),
             "decision_note": ("all-in node: call iff equity vs an assumed jam range covers the actual price; "
                               "jam range is HEURISTIC, multiway is approximated")}
+
+
+def raiser_width(group: str, depth: int, depth_adj: dict) -> float:
+    """Assumed range of the player whose raise this node faces (vs 3-bet / cold 3-bet / vs 4-bet / vs 5-bet)."""
+    kind, raiser_side = group, None
+    if group.startswith("vs_3bet_"):
+        kind, raiser_side = "vs_3bet", group.split("_")[2]
+    elif group.startswith("vs_4bet_") and group != "vs_4bet_cold":
+        kind, raiser_side = "vs_4bet", group.split("_")[2]
+    width = RAISER_100[kind] * depth_adj[RAISER_FAMILY[kind]][depth][1]
+    if raiser_side == "late":
+        width *= LATE_JAM
+    return min(.6, width)
 
 
 def defend_table(rank, strength, n, pos, group, depth, open_cap, arrival: np.ndarray) -> dict:
@@ -238,13 +278,21 @@ def generate(E: np.ndarray, W: np.ndarray, variant: str = "v8.1") -> dict:
     if v.get("defend"):
         data["defend_groups"] = list(DEFEND_GROUPS)
         strength = (E * W).sum(axis=1) / W.sum(axis=1)  # HU equity vs a random hand
+    priced = v.get("priced_raises", False)
+    if priced:
+        data["priced_raises"] = True
     for n, positions in POSITIONS.items():
         for depth in DEPTHS:
             allin = {g: allin_table(rank, E, W, n, depth, g) for g in ALLIN_GROUPS}
+            raiser = {g: raiser_width(g, depth, v["depth_adj"]) for g in RAISE_GROUPS} if priced else {}
+            equity = {g: range_equity(rank, E, W, w) for g, w in raiser.items()}
             for pos in positions:
                 for group in groups_for(n, pos):
-                    # v8 widths do not differ by price yet; both price keys are kept for v7 parity.
-                    table = heuristic_table(rank, n, pos, group, depth, v["depth_adj"], v["open_cap"])
+                    # Both price keys are kept for v7 parity; v8.3 raise nodes price calls at runtime instead.
+                    table = heuristic_table(rank, n, pos, group, depth, v["depth_adj"], v["open_cap"],
+                                            top_never_folds=group in raiser)
+                    if group in raiser:
+                        table |= {"equity": equity[group], "raiser_width": round(raiser[group], 4)}
                     for price in ("normal", "cheap"):
                         data["tables"][f"{n}/{depth}/{pos}/{group}:{price}"] = table
                 for group, table in allin.items():

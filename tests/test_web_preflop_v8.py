@@ -1,6 +1,7 @@
 """Web preflop v8.1 (runtime) and v8: frozen schema 2, depth buckets, vs 3-bet/4-bet/5-bet/all-in contexts, all-in pricing.
 
-v8.2 (failed its gate, not runtime) adds the capped-range defence nodes; its tests are at the end of this module.
+v8.2 (failed its gate alone; read by A8.3) adds the capped-range defence nodes; v8.3 (runtime) prices the
+raise nodes. Their tests are at the end of this module.
 """
 
 import numpy as np
@@ -64,6 +65,8 @@ def test_frozen_v8_and_v81_match_generator_and_cover_every_key():
     assert json.loads(json.dumps(generate(E, W, "v8"))) == v8 and v8["version"] == "web-v8-depth-allin"
     v82 = json.loads(gzip.decompress(VARIANTS["v8.2"]["path"].read_bytes()))
     assert json.loads(json.dumps(generate(E, W, "v8.2"))) == v82 and v82["version"] == "web-v8.2-capped-defence"
+    v83 = json.loads(gzip.decompress(VARIANTS["v8.3"]["path"].read_bytes()))
+    assert json.loads(json.dumps(generate(E, W, "v8.3"))) == v83 and v83["version"] == "web-v8.3-priced-raises"
 
 
 def test_v81_unopened_and_vs_open_match_100bb_at_every_depth():
@@ -283,12 +286,10 @@ def flat_then_squeeze(depth=100):
     return h
 
 
-def test_v82_only_adds_defence_nodes_and_is_the_runtime(v82):
+def test_v82_only_adds_defence_nodes(v82):
     from backend.agents.web_preflop_v8 import DEFEND_GROUPS
-    from backend.api.sessions import _realtime
 
     # v8.2 failed alone (2026-10-26); A8.3 (adaptive, defend only vs frequent isolators / squeezers) passed
-    assert DEFAULT_PATH == V82_PATH and _realtime(0).adaptive and not _realtime(0).station_ranges
     assert v82["version"] == "web-v8.2-capped-defence" and "not GTO" in v82["source"]
     assert v82["defend_groups"] == list(DEFEND_GROUPS)
     assert set(v82["tables"]) == expected_keys(defend=True)
@@ -519,3 +520,123 @@ def test_station_ranges_only_when_explicitly_enabled():
     for kwargs in ({"adaptive": True}, {}):  # A8.1 dropped A8's station range switch
         d = web_realtime.WebRealtimeAgent(0, mode="network", opponent_models=models, **kwargs).act(v, legal)
         assert "station-like" not in d.reason
+
+
+# ---------------------------------------------------------------- v8.3 priced raise nodes
+
+V83_PATH = web_preflop.TABLE_PATH.with_name("web_preflop_v8_3.json.gz")
+
+
+@pytest.fixture
+def v83(monkeypatch):
+    monkeypatch.setattr(web_preflop, "TABLE_PATH", V83_PATH)
+    tables.cache_clear()
+    return tables()
+
+
+def test_v83_with_a83_is_the_runtime():
+    from backend.api.sessions import _realtime
+
+    # v8.3 passed (2026-10-27) against v8.2 + A8.3; web sessions keep A8.3's adaptive defence
+    assert DEFAULT_PATH == V83_PATH and _realtime(0).adaptive and not _realtime(0).station_ranges
+
+
+def is_raise_node(key):
+    from backend.agents.web_preflop_v8 import RAISE_GROUPS
+
+    return key.rsplit("/", 1)[1].split(":")[0] in RAISE_GROUPS
+
+
+def test_v83_changes_only_raise_nodes_and_never_folds_premiums(v83):
+    v82 = web_preflop.json.loads(__import__("gzip").decompress(V82_PATH.read_bytes()))["tables"]
+    assert v83["priced_raises"] is True and set(v83["tables"]) == set(v82)
+    assert {k: t for k, t in v83["tables"].items() if not is_raise_node(k)} == \
+           {k: t for k, t in v82.items() if not is_raise_node(k)}
+    raise_keys = [k for k in v83["tables"] if is_raise_node(k)]
+    assert raise_keys
+    for k in raise_keys:
+        t = v83["tables"][k]
+        assert len(t["equity"]) == 169 and 0 < t["raiser_width"] <= .6
+        for hand in ("AA", "KK", "QQ"):
+            assert t["probs"][CLASS_NAMES.index(hand)][0] == 0, (k, hand)
+        assert t["probs"][CLASS_NAMES.index("72o")][0] == 1, k  # the widening happens at runtime, by price
+
+
+def hand29(raise_to):
+    """6-max, HJ opens 300, BTN calls, BB 3-bets to ``raise_to``; back to the HJ."""
+    h = table(6)
+    fold_to(h, "HJ")
+    h.apply(Action.raise_to(300))
+    h.apply(Action.fold())              # CO
+    h.apply(Action.call())              # BTN
+    h.apply(Action.fold())              # SB
+    h.apply(Action.raise_to(raise_to))  # BB
+    return h.observation(h.to_act), h.legal_actions()
+
+
+def test_v83_raise_node_also_calls_when_realised_equity_covers_the_price(v83):
+    from backend.agents.web_preflop_v8 import REALIZATION
+
+    v, legal = hand29(500)              # min 3-bet: 200 more into 1150
+    probs, t, key = lookup(v, legal)
+    assert key == "6/100/HJ/vs_3bet_late_small:cheap"
+    price = legal.call_amount / (v.pot + legal.call_amount)
+    call = 1 / (1 + np.exp(-np.clip((REALIZATION * np.array(t["equity"]) - price - BEHIND_MARGIN) / CALL_SMOOTHING,
+                                    -60, 60)))  # the BTN caller has not matched the 3-bet: one behind
+    table_probs = np.array(t["probs"])
+    np.testing.assert_allclose(1 - probs[:, 0], np.maximum(1 - table_probs[:, 0], call))
+    np.testing.assert_allclose(probs[:, 2], table_probs[:, 2])  # extra continues are calls
+    qq = probs[CLASS_NAMES.index("QQ")]
+    assert qq[0] == 0 and qq[2] == pytest.approx(.732, abs=.001)
+    opens = np.array(v83["tables"]["6/100/HJ/open:normal"]["probs"])[:, 2] > .5
+    assert (probs[opens, 0] < .05).all()  # every opened hand continues vs a min 3-bet (bar smoothing)
+
+    v, legal = hand29(1500)             # a 5x 3-bet: the price rule adds almost nothing
+    probs, t, key = lookup(v, legal)
+    assert key == "6/100/HJ/vs_3bet_late_large:normal"
+    assert np.abs(probs - np.array(t["probs"])).max() < .05
+
+
+def test_v82_raise_nodes_ignore_the_price(v82):
+    a, t, _ = lookup(*hand29(500))
+    b, _, _ = lookup(*hand29(900))
+    np.testing.assert_array_equal(a, b)
+    assert "equity" not in t and a[CLASS_NAMES.index("QQ"), 0] > 0
+
+
+def test_minraise_probe_min_raises_the_first_raise_it_faces():
+    from scripts.experiments.preflop_exploiters import MinRaiseProbe
+
+    h = table(6)
+    v, legal = h.observation(h.to_act), h.legal_actions()
+    assert "probe" not in (MinRaiseProbe(0).act(v, legal).reason or "")   # unopened: rule-based
+    h.apply(Action.raise_to(300))
+    legal = h.legal_actions()
+    assert MinRaiseProbe(0).act(h.observation(h.to_act), legal).action.amount == legal.min_raise_to == 500
+    h.apply(Action.raise_to(500))       # HJ min 3-bets
+    fold_to(h, "LJ")
+    h.apply(Action.raise_to(1200))      # LJ 4-bets: the probe already raised, so it plays rule-based
+    v, legal = h.observation(h.to_act), h.legal_actions()
+    assert "probe" not in (MinRaiseProbe(0).act(v, legal).reason or "")
+
+
+@pytest.mark.parametrize("n", (2, 6, 9))
+def test_v83_preflop_is_legal_against_minraise(v83, n):
+    from scripts.experiments.preflop_exploiters import MinRaiseProbe
+
+    priced = 0
+    for depth in (25, 100, 150):
+        for seed in range(8):
+            h = table(n, depth, seed)
+            hero = h.seats[seed % n]
+            agents = {s: (WebRealtimeAgent(seed, mode="network", adaptive=True) if s == hero else MinRaiseProbe(seed + s))
+                      for s in h.seats}
+            while not h.is_over and h.street is Street.PREFLOP:
+                v, legal = h.observation(h.to_act), h.legal_actions()
+                decision = agents[v.seat].act(v, legal)
+                assert legal.is_legal(decision.action)
+                if v.seat == hero and decision.reason.startswith("frozen preflop"):
+                    assert decision.reason.startswith("frozen preflop web-v8.3-priced-raises")
+                    priced += any(f"/{g}" in decision.reason for g in ("vs_3bet_", "cold_vs_3bet", "vs_4bet_", "vs_5bet"))
+                h.apply(decision.action)
+    assert priced, "the probe should put the hero in at least one priced raise node"

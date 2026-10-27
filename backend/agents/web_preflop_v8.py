@@ -7,6 +7,10 @@ call/fold decision uses the actual pot odds of the hand being played.
 v8.2 tables (``defend_groups`` present) add two ``:mdf`` nodes for a player whose range is capped by
 an earlier passive action: a limper facing a raise and a flatter facing a squeeze. They store each
 hand's percentile within that capped range and continue with the best MDF-scaled fraction of it.
+
+v8.3 tables (``priced_raises``) store, in every vs 3-bet / cold 3-bet / vs 4-bet / vs 5-bet node, each
+hand's equity vs an assumed raiser range. A hand then also continues (by calling) when that equity,
+discounted for realisation, covers the actual price, so a cheap raise is not folded to like a large one.
 """
 
 from __future__ import annotations
@@ -42,6 +46,9 @@ BEHIND_MARGIN = .03
 DEFEND_GROUPS = ("limp_vs_raise", "flat_vs_squeeze")
 DEFEND_SMOOTHING = .03
 OTHER_DEFENDER_DECAY = .75
+# v8.3 priced raise nodes: share of its raw equity a non-all-in caller is assumed to realise postflop.
+# shortcut: one constant for every hand, position and depth; replace with solver realisation estimates.
+REALIZATION = .70
 
 
 def depth_bucket(bb: float) -> int:
@@ -138,19 +145,34 @@ def key(view: PlayerView, legal: LegalActions, defend: bool = False) -> str:
     return f"{len(view.seats)}/{depth_bucket(effective_bb(view))}/{position(view)}/{context(view, legal, defend)}"
 
 
-def allin_probs(view: PlayerView, legal: LegalActions, table: dict) -> np.ndarray:
-    """Call iff equity vs the assumed jam range covers the actual price (smoothed near breakeven)."""
+def call_probs(view: PlayerView, legal: LegalActions, equity, realization: float = 1.0) -> np.ndarray:
+    """Probability of calling: realised equity vs the table's assumed range covers the actual price (smoothed)."""
     live = [s for s in view.seats if not s.folded and s.seat != view.seat]
     committed = [s for s in live if s.all_in or s.street_bet >= view.current_bet]
     behind = len(live) - len(committed)
     # shortcut: equity vs several committed ranges approximated as eq ** k (independent showdowns);
     # players still to act add a fixed margin. Replace with a multiway equity model when one exists.
-    eq = np.asarray(table["equity"], dtype=float) ** max(1, len(committed))
+    eq = np.asarray(equity, dtype=float) ** max(1, len(committed))
     price = legal.call_amount / (view.pot + legal.call_amount)
     need = price + BEHIND_MARGIN * behind
-    z = np.clip((eq - need) / CALL_SMOOTHING, -60, 60)
-    call = 1 / (1 + np.exp(-z))
+    z = np.clip((realization * eq - need) / CALL_SMOOTHING, -60, 60)
+    return 1 / (1 + np.exp(-z))
+
+
+def allin_probs(view: PlayerView, legal: LegalActions, table: dict) -> np.ndarray:
+    """Call iff equity vs the assumed jam range covers the actual price (smoothed near breakeven)."""
+    call = call_probs(view, legal, table["equity"])
     return np.stack([1 - call, call, np.zeros_like(call)], axis=1)
+
+
+def priced_probs(view: PlayerView, legal: LegalActions, table: dict) -> np.ndarray:
+    """v8.3 raise node: the table row, widened by calls whose realised equity covers the actual price."""
+    probs = np.array(table["probs"], dtype=float)
+    if not legal.can_call:
+        return probs
+    cont = np.maximum(1 - probs[:, 0], call_probs(view, legal, table["equity"], REALIZATION))
+    raising = np.minimum(probs[:, 2], cont)
+    return np.stack([1 - cont, cont - raising, raising], axis=1)
 
 
 def defend_probs(view: PlayerView, legal: LegalActions, table: dict) -> np.ndarray:
@@ -171,7 +193,10 @@ def _unit_list(x) -> bool:
 def validate(data: dict) -> None:
     if set(data["tables"]) != expected_keys("defend_groups" in data):
         raise ValueError("incomplete frozen web preflop v8 tables")
+    raise_groups = set(RAISE_GROUPS) if data.get("priced_raises") else set()
     for k, table in data["tables"].items():
+        if k.rsplit("/", 1)[1].split(":")[0] in raise_groups and not _unit_list(table.get("equity")):
+            raise ValueError(f"invalid raiser-range equity in {k}")
         if k.endswith(":allin"):
             if not _unit_list(table.get("equity")):
                 raise ValueError(f"invalid equity in {k}")
@@ -198,6 +223,8 @@ def lookup(view: PlayerView, legal: LegalActions, data: dict, defend: bool = Fal
         probs = allin_probs(view, legal, table)
     elif k.endswith(":mdf"):
         probs = defend_probs(view, legal, table)
+    elif "equity" in table:
+        probs = priced_probs(view, legal, table)
     else:
         probs = np.array(table["probs"], dtype=float)
     return probs, table, k

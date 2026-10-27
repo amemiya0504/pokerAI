@@ -19,7 +19,9 @@ from backend.solver.hands import CLASS_NAMES, COMBOS, class_index
 from .pushfold import PushFoldAgent, preflop_order
 
 # A8.3 passed (2026-10-27): v8.2 = v8.1 + defence nodes, read only by adaptive agents (defend=True).
-TABLE_PATH = Path(__file__).with_name("data") / "web_preflop_v8_2.json.gz"
+# v8.3 passed (2026-10-27): v8.2 + priced raise nodes (premiums never fold; calls when realised equity
+# covers the price). Range estimates read the same priced nodes.
+TABLE_PATH = Path(__file__).with_name("data") / "web_preflop_v8_3.json.gz"
 POSITIONS = {
     2: ("BTN/SB", "BB"),
     3: ("BTN", "SB", "BB"),

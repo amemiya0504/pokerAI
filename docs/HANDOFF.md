@@ -228,6 +228,50 @@
 - 限制：只驗 100 BB 與這些模擬對手；防守只在同一個網頁 session 中、對手至少 8 次 iso／squeeze 機會且比例 ≥ 50% 後才啟用，對真人的效果未驗證。固定 Arena 沒有重跑（理由見門檻第 5 點）。
   - 可能的下一步（未做，需新門檻與新種子）：找出 lag 6-max 那 14 個 deal 的情境並修正後再驗收；或接受目前結果，維持 v8.1。
 
+### 翻前 v8.3 面對加注節點看實際賠率、頂端牌型不棄牌（2026-10-27 驗收通過；目前 runtime：v8.3 表＋網頁 session `adaptive=True`）
+
+- 起因（使用者回報，網頁第 29 手）：6-max HJ 用 QQ 開到 300，BTN 跟，BB 最小再加注到 500；QQ 只需補 200 進 1,350 的底池（price 0.148）卻棄牌。
+  - 節點 `6/100/HJ/vs_3bet_late_small:cheap` 的 QQ 列是 fold 0.052／call 0.216／raise 0.732，這次抽到 fold。
+  - 原因 1：產生器用 `smooth(rank, defend, .025)`，而 vs 3bet／cold 3bet／vs 4bet／vs 5bet 的繼續寬度只有 2–9%，與平滑寬度同量級，連 AA 都到不了 100% 繼續。v8.2 全表 AA 平均棄牌率：vs 3bet 4.6%、cold 3bet 24%、vs 4bet 15%、vs 5bet 21%（QQ 分別 6.4%、32%、20%、28%）。
+  - 原因 2：v8 寬度不分價格（`cheap`／`normal` 同一張表），最小 3bet 和 3 倍 3bet 用同一列。
+- 改動（只動加注節點；表 `backend/agents/data/web_preflop_v8_3.json.gz`，version `web-v8.3-priced-raises`，與 v8／v8.1／v8.2 一起產生，舊三張重新產生後位元相同）：
+  1. 加注節點中 AA、KK、QQ，以及繼續範圍較強的一半（rank ≤ 繼續寬度／2）一律不棄牌（`PREMIUM_SHARE`）。
+  2. 加注節點另存每手牌對「假設的加注者範圍」的 equity（`RAISER_100`：vs 3bet 8%、cold 3bet 6%、vs 4bet 3.5%、vs 5bet 2.5%，乘上加注者所在節點的深度加注係數，後位再 ×1.35）。runtime（`priced_probs`）在 `0.70 × equity ≥ price + 0.03 × 後面還沒行動的人數` 時也繼續（平滑同 all-in 節點），多出的繼續一律是跟注；只會放寬、不會比表更緊。
+  - 其他 7,000 多張表與 v8.2 完全相同；沒有 `priced_raises` 的表（v8.2）行為不變。
+  - 靜態結果：第 29 手 QQ 棄牌 0；面對最小 3bet，HJ 的 open 範圍全部繼續（v8.2 只繼續 33%）；3 倍 3bet 繼續 41%（v8.2 33%）；5 倍 3bet 28%（v8.2 26%）。
+  - 剝削探針 `minraise`（`preflop_exploiters.py`）：每手第一次面對 open 或 3bet 時，用任意兩張牌最小再加注，其餘照 RuleBasedAgent。
+  - `web_policy_ab.py --baseline-adaptive`：baseline 也用 adaptive，用來對照目前網頁 runtime（v8.2＋A8.3）。
+  - 測試：四個測試檔（`test_web_preflop_v8.py`、`test_web_realtime.py`、`test_api.py`、`test_api_ai.py`）128 passed。
+- **v8.3 驗收門檻（2026-10-27 20:40 CST，執行前訂定，不事後調整）**：
+  1. **100 BB**：`web_policy_ab.py --baseline backend/agents/data/web_preflop_v8_2.json.gz --candidate backend/agents/data/web_preflop_v8_3.json.gz --baseline-label A8.3 --candidate-label v8.3 --persistent-models --baseline-adaptive --candidate-adaptive --deals 3000 --seconds 2 --seed 20261112`，2–9-max × {station, rule, iso, squeeze, nit, tag, lag, maniac, minraise} 共 72 組：每組 v8.3−A8.3 的 95% CI 上界都 ≥ 0。
+  2. **40 BB 與 150 BB**：同上加 `--stack-bb {40,150}`，2–9-max × {rule, lag} 共 32 組：每組 95% CI 上界都 ≥ 0。
+  3. **minraise 必須顯著改善**：100 BB minraise 8 組合併（各組 bb/100 平均，SE = √(Σ 各組 SE²)/8），95% CI 下界 > 0。
+  4. 1–3 都通過，runtime 才改為 v8.3 表（`web_preflop.TABLE_PATH`，網頁 session 仍是 `adaptive=True`）；任一項不通過，runtime 維持 v8.2＋A8.3 並先分析，不調整門檻。
+  5. 不重跑固定 Arena：station 從不加注，所以 v8.3 對 station 與 v8.2 完全相同；對 rule 的影響由第 1、2 項配對檢查。這是限制，照實記錄。
+  - 種子 20261112 未用於設計：v8.3 的參數只看過靜態探針（第 29 手與固定牌局的 lookup），沒有看過任何模擬結果。冒煙測試（只確認流程）用種子 20261113，結果不採計。
+  - 104 組中即使兩版無差異，也可能有 1–2 組偽失敗；station 等不觸發加注節點的組會正好是 0。照實記錄，不改門檻。
+  - 輸出 `out/web-realtime/v83-{opponent}-{stack}bb-{n}-3000.json`，manifest `v83-eval.manifest.txt`，進度 `v83-eval.out`，判定腳本 `v83_gate.py`（scratchpad）。
+- **v8.3 驗收結果（10-27 20:41–21:58，104 組全部完成、全部 exit 0）：通過**。單位 bb/100、95% CI。
+  - 條件 1 通過：100 BB 72 組的 CI 上界都 ≥ 0，沒有任何一組顯著為負。
+    - station 8 組正好是 0；rule、iso、squeeze 的 2-max 也是 0，3–9-max 全部不顯著（−1.22 到 +3.10）。
+    - nit：8-max +11.81 [+4.96,+18.66]、9-max +8.43 [+2.10,+14.76] 顯著為正，其他不顯著。
+    - tag：6–9-max 顯著為正（+12.81、+17.79、+27.94、+16.64），2–5-max 不顯著。
+    - lag：5–9-max 顯著為正（+22.05 到 +48.13），2–4-max 不顯著。
+    - maniac：3–9-max 顯著為正（+22.83 到 +63.57），2-max +1.03 不顯著。
+  - 條件 2 通過：40／150 BB 32 組的 CI 上界都 ≥ 0。
+    - rule 16 組全部不顯著（40 BB −0.97 到 +0.39；150 BB −2.05 到 +3.26）。逐位置只有 40 BB 9-max UTG+2 −4.8 顯著為負，整組 +0.08 [−1.11,+1.26]。
+    - lag：40 BB 6–9-max 顯著為正（+10.62 到 +20.92）；150 BB 3、5–9-max 顯著為正（+23.29 到 +58.41）；其他不顯著。
+  - 條件 3 通過：minraise 合併 +59.66 [+55.02,+64.29]；8 組各自都顯著為正（+52.63 到 +68.61）。
+  - 解讀：增益集中在會 3bet／4bet 的對手（minraise、maniac、lag、tag），符合「v8.2 面對加注棄太多」的診斷。對不常再加注的 rule 沒有可量測的差異。
+- **runtime 已切換（照門檻第 4 點）**：
+  - `web_preflop.TABLE_PATH` 改為 `web_preflop_v8_3.json.gz`；網頁 session 仍是 `adaptive=True`（A8.3 防守照舊）。
+  - 範圍估計（`ranges`）也走同一個 `lookup`，所以對手面對加注時的範圍估計同樣看價格；這已包含在驗收的配對中。
+  - 測試 `test_v83_with_a83_is_the_runtime` 檢查以上設定（原 `test_v82_only_adds_defence_nodes_and_is_the_runtime` 改名為 `test_v82_only_adds_defence_nodes`）。四個測試檔 129 passed；全專案 pytest 307 passed、10 skipped、1 failed（同上，舊的 Leduc 收斂測試，與 v8.3 無關）。
+- 限制：
+  - 只驗模擬對手。`REALIZATION = 0.70` 與假設的加注者範圍是捷徑，不是求解結果。
+  - 沒有 adaptive 的呼叫端（Arena、舊實驗）現在也讀 v8.3 的加注節點，所以不再與 v8.1 完全相同；對 station 仍相同（station 不加注）。
+  - 固定 Arena 沒有重跑（理由見門檻第 5 點）。
+
 ## 暫停檢查點（2026-10-24 19:43 CST；歷史紀錄）
 
 - 使用者要把計算移到另一台電腦；目前評估程序已按 PID 停止。SIGINT 一度被背景程序忽略，之後對各工作 PID 發 SIGTERM。已確認沒有 web_policy_ab.py、web_realtime_accept.py、Arena runner、網路評估、網站 supervisor 或 vite/uvicorn 程序仍在跑。
