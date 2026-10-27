@@ -14,7 +14,7 @@
 | M6 · GTO Dataset Pipeline | ✅ 完成（見下方驗收結果） |
 | M7 · GTO Policy Network | ⚠️ 模仿指標達標，但策略本身仍高度可被剝削（見下方） |
 | 即時求解 Agent · A、B、C 階段 | ✅ M8 對手模型已接入；原 Arena Agent 保持基準路徑 |
-| Web AI 2–9 人 | ✅ 翻前 v8.1 通過驗收（100 BB Arena gate；40／150 BB 對 v7 配對 32 組都不顯著為負），為目前 runtime；v8 未通過（40 BB 對 station） |
+| Web AI 2–9 人 | ✅ 翻前 v8.1 通過驗收（100 BB Arena gate；40／150 BB 對 v7 配對 32 組都不顯著為負）；A8.3 依對手啟用 v8.2 防守通過驗收（2026-10-27），目前 runtime 是 v8.2 表＋網頁 session `adaptive=True`；v8 未通過（40 BB 對 station） |
 | M8 · Opponent Modeling | ✅ 完成（門檻版本 2、新種子重跑通過；版本 1 的結果與原因見下方「M8 驗收結果」） |
 | M9 · Exploit Engine | ⚠️ 精確前置檢查通過；Arena E1 未過、E2 通過（見下方「M9 驗收結果」） |
 | M10 | 未開始 |
@@ -571,7 +571,7 @@ A6 的 pot-odds 邊界測試與 5–9-max 配對 CPU 診斷已通過；A7 增加
 
 設計：[`docs/realtime-agent.md`](docs/realtime-agent.md)。M7 的網路策略本身高度可被剝削，所以實際對戰改成**做決策當下對子賽局求解**，網路只當備援。目前只做單挑。
 
-### 翻前 v8.1（目前 runtime；2026-10-26 驗收通過）
+### 翻前 v8.1（2026-10-26 驗收通過；目前 runtime 是 v8.2 表，沒有觸發防守時與 v8.1 完全相同，見「A8.3」）
 
 `backend/agents/data/web_preflop_v8_1.json.gz`：與 v8 相同的 schema、深度分桶與 vs 3bet／cold 3bet／vs 4bet／vs 5bet／all-in 節點，但 open／limp／option 與 vs open 的範圍和尺寸在每個深度都與 v7 相同（v8 在這兩處的淺籌碼調整是 40 BB 對 station 虧損的原因）。驗收門檻在執行前寫入 `docs/HANDOFF.md`：100 BB 固定 Arena gate 通過；40／150 BB 對 v7 的配對（新種子 20261102）32 組都不顯著為負，其中 4 組顯著為正。仍是 HEURISTIC，不是 GTO。
 
@@ -580,6 +580,26 @@ A6 的 pot-odds 邊界測試與 5–9-max 配對 CPU 診斷已通過；A7 增加
 ### 翻前 v8.2（2026-10-26 驗收未通過，不是 runtime）
 
 `backend/agents/data/web_preflop_v8_2.json.gz`：v8.1 加上兩個依「到達範圍」防守的節點（limp 後被加注、平跟後被 squeeze）。對每次都 iso／squeeze 的剝削探針，多人桌 iso 有改善，但 2-max iso 與 6-max squeeze 沒有達到門檻；對 rule 在 7-max 40／100 BB 顯著為負。runtime 維持 v8.1。剝削探針在 `scripts/experiments/preflop_exploiters.py`（`web_policy_ab.py --opponents iso squeeze`）。
+
+### A8 依對手風格切換（2026-10-26 驗收未通過，預設關閉）
+
+`WebRealtimeAgent(adaptive=True)` 會用跨手保存的對手資料決定兩件事：VPIP 高、PFR 低的 station-like 對手，在多人翻後用均勻範圍；常 iso／squeeze 的對手，才啟用 v8.2 的防守節點。沒有對手資料時與 v8.1 完全相同。用保留對手模型的配對（`web_policy_ab.py --persistent-models --candidate-adaptive`）驗收：對 iso／lag／maniac 多數為正，對 rule 不變，但對 station 6-max 顯著為負（−78.76 bb/100），所以沒有啟用。
+
+### A8.1 只依對手啟用防守（2026-10-26 驗收未通過，預設關閉）
+
+A8.1 拿掉 station 範圍切換（移到預設關閉的 `station_ranges=True`），只保留「對常 iso／squeeze 的加注者才用 v8.2 防守」。新種子 20261109 驗收：iso＋squeeze 合併 +1.35 bb/100 [+0.73,+1.97]，但 station 9-max −92.07 [−138.90,−45.24]，所以沒有啟用。原因是載入 v8.2 表時，英雄估計對手翻前範圍的 `lookup` 預設會用防守節點，把 station「limp 後跟加注」的範圍估錯，翻後打法因此改變。A8 也有同樣問題，所以 A8 對 station 的失敗不能只歸因於 station 範圍切換。
+
+### A8.2 修正範圍估計（2026-10-27 驗收未通過，預設關閉）
+
+`lookup` 改成只有 `defend=True` 時才用 v8.2 防守節點，範圍估計一律用 v8.1 節點；沒有 adaptive 時載入 v8.2 表也與 v8.1 完全相同。新種子 20261110 驗收：對 station、nit 完全相同，iso＋squeeze 合併 +1.67 bb/100 [+1.06,+2.28]，但 lag 6-max −0.15 [−0.25,−0.05]（3000 deals 中 14 個 deal 有差異、全部為負），所以依門檻沒有啟用。
+
+### A8.3 只在沒人跟注加注時防守（2026-10-27 驗收通過，目前 runtime）
+
+網頁 session 的 AI 現在是 `WebRealtimeAgent(adaptive=True)`，讀 v8.2 表。同一個 session 中，如果某個對手被觀察到常 iso（limp 後加注）或常 squeeze（至少 8 次機會、比例 ≥ 50%），而且他這次加注後還沒有人跟注，AI 才用 v8.2 的 capped-range 防守節點；其他情況（包括範圍估計）都與 v8.1 完全相同。
+
+驗收（新種子 20261111，100 BB，2–9-max × 8 種對手 64 組，保留對手模型的配對）：64 組的 95% CI 上界都 ≥ 0；iso＋squeeze 合併 +2.06 bb/100 [+1.65,+2.48]，iso 3–9-max、squeeze 4–9-max 每組都顯著為正；對 station、rule、nit 完全相同。限制：只驗 100 BB 與模擬對手。
+
+A8 系列的經過：A8（加 station 範圍切換）、A8.1（範圍估計誤用防守節點）、A8.2（多人底池防守在 lag 6-max 小輸）都沒通過，每次修正後都換新種子、事先訂門檻重跑。詳見 `docs/HANDOFF.md`。
 
 ### 翻前 v8（深度分桶、vs 3bet／4bet／all-in；2026-10-25 驗收未通過）
 

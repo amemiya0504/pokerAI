@@ -57,9 +57,12 @@ def context_rates(counts):
 BB_CHIPS = 100
 
 def simulate(n, opponent, deals, seed, mode, seconds, log=print, capture_samples=False, multiway_bluff=False, deal_start=0,
-             stack_bb=100):
+             stack_bb=100, persistent_models=False, adaptive=False, station_ranges=False):
+    """``persistent_models``: hero keeps one opponent-model dict for the whole run (every opponent seat
+    holds the same opponent type), as a web session does; by default each hand starts with none."""
     if deal_start < 0:
         raise ValueError("deal_start must be nonnegative")
+    shared_models = {} if persistent_models else None
     by_position = {pos: Counter() for pos in POSITIONS[n]}
     by_context = {pos: {} for pos in POSITIONS[n]}
     profits = []
@@ -77,7 +80,8 @@ def simulate(n, opponent, deals, seed, mode, seconds, log=print, capture_samples
             h = HandState({s: round(stack_bb * BB_CHIPS) for s in range(n)}, 0, BB_CHIPS // 2, BB_CHIPS,
                           Deck(derive_seed(seed, n, deal)))
             hero_position = position(h.observation(hero))
-            agent = WebRealtimeAgent(derive_seed(seed, n, deal, hero), mode=mode, seconds=seconds, multiway_bluff=multiway_bluff)
+            agent = WebRealtimeAgent(derive_seed(seed, n, deal, hero), mode=mode, seconds=seconds, multiway_bluff=multiway_bluff,
+                                     opponent_models=shared_models, adaptive=adaptive, station_ranges=station_ranges)
             others = {s: OPPONENTS[opponent](derive_seed(seed, n, deal, hero, s)) for s in range(n) if s != hero}
             stats = by_position[position(h.observation(hero))]
             stats["hands"] += 1

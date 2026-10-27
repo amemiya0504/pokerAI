@@ -53,7 +53,8 @@ def _pushfold(seed: int):
 def _realtime(seed: int, opponent_models: dict | None = None):
     from backend.agents.web_realtime import WebRealtimeAgent
 
-    return WebRealtimeAgent(seed, opponent_models=opponent_models)
+    # A8.3 (2026-10-27): defend capped ranges only vs raisers this session has seen iso / squeeze often
+    return WebRealtimeAgent(seed, opponent_models=opponent_models, adaptive=True)
 
 
 def _strategy_label(decision) -> str:

@@ -107,6 +107,127 @@
     - HU 改 open 表，不要只用最弱的牌 limp。
     - 新一輪都要重新訂門檻與種子。
 
+### A8 依對手風格切換（opt-in，`WebRealtimeAgent(adaptive=True)`；2026-10-26 驗收未通過，預設關閉，runtime 維持 v8.1）
+
+- 目的：A5 顯示 public 對手範圍對 station 少賺很多，v8.2 顯示固定的 capped-range 防守對 rule 小輸。改成依觀察到的對手風格決定，只在對手像 station 或常 iso／squeeze 時才改變行為。
+- 實作（`backend/agents/web_realtime.py`；M8／M9 程式未改）：
+  - **統計**：`hand_over` 除了更新 M8 模型，也記錄每個座位的 iso 機會／次數（第一次行動時前面有 limper 且無人加注）和 squeeze 機會／次數（第一次行動時有一個 open 加上至少一個跟注者）。記在同一個 `opponent_models` dict 的 `"preflop_style"` 鍵，網頁 session 本來就會跨手保存並 deep copy 這個 dict。
+  - **station-like**：M8 VPIP 觀察 ≥ 30 手、VPIP ≥ 0.40、PFR ≤ 0.08。多人翻後估 equity 時，這些座位用均勻範圍（A5 的 uniform），其餘座位照舊用 public range。
+  - **常 iso／squeeze**：機會 ≥ 8 次，且 (次數 + 1)／(機會 + 2) ≥ 0.50。只有在加注者被判定為常 iso（limp 後被加注）或常 squeeze（平跟後被 3bet）時，才用 v8.2 的 capped-range 防守節點；否則與 v8.1 完全相同。
+  - **沒有對手資料時與 v8.1 完全相同**（測試 `test_adaptive_without_history_plays_exactly_v81`）。
+- 評估工具：`simulate(..., persistent_models=True)`、`web_policy_ab.py --persistent-models --candidate-adaptive`。英雄在整個 run 保留同一份對手模型（每個對手座位都是同一種對手），像網頁 session 一樣；兩邊都用這個 harness。原本的 Arena／配對每手都重建 agent，模型永遠是空的，A8 不會觸發。
+- 門檻設計前的分類檢查（設計種子 20261108，只看對手行為統計、沒看輸贏；`classify_check.py`，150 deals）：
+  - station 的座位都被判為 station-like，其他類型都沒有。
+  - iso／squeeze 探針分別 100% iso／squeeze，會被判定。
+  - rule、nit 不觸發；tag 只有 3-max 一個座位觸發 iso；lag、maniac 部分座位被判為常 iso／squeeze（它們確實常這樣打）。
+- 測試：`tests/test_web_preflop_v8.py`、`test_web_realtime.py`、`test_api.py`、`test_opponent.py` 共 122 passed。
+- **A8 驗收門檻（2026-10-26 17:22 CST，執行前訂定，不事後調整）**：
+  1. `web_policy_ab.py --baseline web_preflop_v8_1.json.gz --candidate web_preflop_v8_2.json.gz --baseline-label v8.1 --candidate-label A8 --persistent-models --candidate-adaptive --deals 3000 --seconds 2 --seed 20261107`，100 BB，2–9-max × {rule, station, iso, squeeze, nit, tag, lag, maniac} 共 64 組：每組 A8−v8.1 的 95% CI 上界都 ≥ 0。
+  2. station 3-max 與 4-max 的 95% CI 下界 > 0（A5 在這兩個桌型 public 比 uniform 少賺 111／121 bb/100，A8 必須顯著改善）。
+  3. iso／squeeze 不要求顯著改善（v8.2 已顯示效果小），結果照實記錄。
+  4. 1、2 都通過才算 A8 通過。通過後 runtime 改為 v8.2 表加 `adaptive=True`（網頁 session）；並改成只有明確要求時才用防守節點，避免沒有 adaptive 的呼叫端誤用 v8.2 的防守。不通過則維持 v8.1、預設不啟用，不調整門檻。
+  5. 不重跑固定 Arena：Arena 每手重建 agent、沒有對手資料，A8 與 v8.1 決策完全相同（上述測試），A6／v8.1 的 Arena 結果直接適用。
+  - 限制：只驗 100 BB；64 組中即使無差異也可能有約 1–2 組偽失敗（多數組 A8 不觸發、差異為 0，實際更少），照實記錄。
+  - 輸出 `out/web-realtime/a8-{opponent}-{n}-3000.json`，manifest `a8-eval.manifest.txt`，進度 `a8-eval.out`。
+- **A8 驗收結果（10-26 17:22–18:40，64 組全部完成）：未通過**。判定腳本 `a8_gate.py`（scratchpad）。A8 維持 opt-in、預設關閉，runtime 不變（v8.1，網頁未啟用 adaptive）。
+  - **station：未通過**。6-max −78.76 [−130.75,−26.76] 顯著為負；3-max +24.80 [−6.71,+56.31]、4-max −21.71 [−59.11,+15.68] 都沒有達到「顯著為正」。其他桌型：2-max +7.57、5-max −10.53、7-max −29.89、8-max −19.67、9-max +79.45 [+26.33,+132.58]（顯著為正）。BTN／CO 幾乎每個桌型都為負（6-max BTN −327.9、8-max BTN −299.1）。所以多人翻後對 station 改用均勻範圍，並沒有重現 A5 的改善。A5 是對所有座位都改 uniform，而且用的是 v3 表；兩者不能直接比較，原因尚未查明。
+  - rule：2–5-max 差異正好是 0（分類器沒有觸發），6–9-max 不顯著（−0.94 到 +0.32）。nit、tag 都不顯著。
+  - 對積極的對手大多是正的：
+    - iso：8 組點估計全部為正，8-max +2.55 [+0.57,+4.52] 顯著。
+    - squeeze：不顯著，−1.18 到 +2.89。
+    - lag：5-max +4.62 [+0.52,+8.72]、7-max +4.08 [+0.60,+7.55] 顯著。
+    - maniac：2-max +15.34 [+3.42,+27.26] 顯著。
+  - 解讀：只對常 iso／squeeze 的對手才啟用 v8.2 防守，方向看起來是對的，而且對 rule 不再造成損失（v8.2 的問題）。失敗來自 station 的範圍切換。
+  - 可能的下一步（未做，需新門檻與新種子）：
+    - 拿掉 station 範圍切換，只保留「依對手啟用防守」重新驗收。
+    - 另外查 station 範圍切換為何讓 BTN／CO 大輸，可能是均勻範圍讓英雄 value bet 太寬或跟注太多。
+  - **更正（10-26 21:25，A8.1 後發現）**：上面「失敗來自 station 範圍切換」的解讀不成立。A8 和 A8.1 都有下面 A8.1 段落記錄的範圍估計 bug，A8 對 station 的結果同時混了兩個因素，無法分開。
+
+### A8.1 只依對手啟用防守（opt-in，`WebRealtimeAgent(adaptive=True)`；2026-10-26 驗收未通過，預設關閉，runtime 維持 v8.1）
+
+- 改動：`adaptive=True` 不再做 station 範圍切換，只保留「加注者被判定為常 iso／squeeze 時才用 v8.2 防守節點」；分類門檻、統計方式都與 A8 相同，未調整。
+  - A8 的 station 範圍切換移到另一個開關 `station_ranges=True`（預設關閉，只用來重現 A8；`web_policy_ab.py --candidate-station-ranges`）。
+  - 測試 `test_station_ranges_only_when_explicitly_enabled`：只開 `adaptive` 時不會用均勻範圍。四個測試檔共 122 passed。
+- 設計依據（注意：下面的門檻是看過 A8 種子 20261107 的結果後訂的，所以 A8.1 一律換新種子 20261109，A8 的數字不算進驗收）：
+  - A8 對 iso／squeeze 16 組合併（各組 bb/100 平均、各組獨立的 SE）為 +1.13 [+0.30,+1.96]；iso 單獨 +1.52 [+0.28,+2.76]，squeeze 單獨 +0.74 [−0.36,+1.84]。
+  - iso／squeeze 每組改用 6000 deals，SE 約縮小為 1/√2。若真實效果與 A8 相同，合併檢定的檢定力約 97%；A8 的估計可能偏高（挑選效應），若真實效果只有 +0.7，檢定力約 65%。
+  - station 不再有特別要求：A8.1 只在加注者常 iso／squeeze 時才改變行為，分類檢查顯示 station 不會被判定，預期差異接近 0。
+- **A8.1 驗收門檻（2026-10-26 20:02 CST，執行前訂定，不事後調整）**：
+  1. `web_policy_ab.py --baseline web_preflop_v8_1.json.gz --candidate web_preflop_v8_2.json.gz --baseline-label v8.1 --candidate-label A8.1 --persistent-models --candidate-adaptive --seconds 2 --seed 20261109`，100 BB，2–9-max × {station, rule, iso, squeeze, nit, tag, lag, maniac} 共 64 組；iso、squeeze 用 `--deals 6000`，其他用 `--deals 3000`。每組 A8.1−v8.1 的 95% CI 上界都 ≥ 0。
+  2. iso＋squeeze 16 組合併：各組 A8.1−v8.1 bb/100 的平均，SE = √(Σ 各組 SE²)/16（各組 SE = CI 寬度／(2×1.96)），95% CI 下界 > 0。這是要證明依對手啟用防守確實有用，而不只是沒有傷害。
+  3. lag、maniac 等其他對手不要求顯著改善，結果照實記錄。
+  4. 1、2 都通過才算 A8.1 通過。通過後 runtime 改為 v8.2 表加 `adaptive=True`（網頁 session），並把 `lookup` 改成只有 `defend=True` 時才用防守節點，避免沒有 adaptive 的呼叫端用到 v8.2 防守。不通過則維持 v8.1、預設不啟用，不調整門檻。
+  5. 不重跑固定 Arena：理由同 A8（每手重建 agent、沒有對手資料，與 v8.1 決策完全相同）。
+  - 限制：只驗 100 BB；只驗這些模擬對手，真人的 iso／squeeze 頻率可能不同；64 組中即使無差異也可能有 1–2 組偽失敗，照實記錄。
+  - 輸出 `out/web-realtime/a81-{opponent}-{n}-{deals}.json`，manifest `a81-eval.manifest.txt`，進度 `a81-eval.out`，判定腳本 `a81_gate.py`（scratchpad）。
+- **A8.1 驗收結果（10-26 20:02–21:17，64 組全部完成）：未通過**。A8.1 維持 opt-in、預設關閉，runtime 不變。
+  - 條件 1 **未通過**：station 9-max −92.07 [−138.90,−45.24]（BTN −316.3 顯著）。其餘 63 組 CI 上界都 ≥ 0；station 8-max −42.87 [−87.54,+1.80]、2-max −30.02 [−61.98,+1.95] 也接近失敗。
+  - 條件 2 通過：iso＋squeeze 合併 +1.35 [+0.73,+1.97]。iso 3／4／5／8／9-max 單組顯著為正（+1.94 到 +4.16），squeeze 4-max +3.14 [+0.67,+5.62]。
+  - rule：2–5-max、8-max 正好是 0，6／7／9-max 不顯著。nit、tag 都不顯著。lag 3-max +14.08、9-max +3.11，maniac 3-max +13.43 顯著為正。
+  - **原因（驗收後診斷，未改程式）**：A8.1 對 station 的翻前行動和 v8.1 一樣，但候選載入的是 v8.2 表。英雄估計對手範圍的 `web_preflop.probabilities()`（`ranges()` 和多人翻後的 `_public_ranges` 都用它）呼叫 `lookup(view, legal)` 沒有傳 `defend`，預設會用 v8.2 的防守節點。所以只要有人「limp 後跟加注」或「平跟後跟 squeeze」，英雄對那個人的範圍估計就換成 v8.2 的 capped 防守範圍，而不是 v8.1 的範圍。station 正好最常這樣打。
+    - 檢查（`a81_range_check.py`，scratchpad）：limp 後跟 iso 的範圍，v8.1 與 v8.2 的 total variation 在 3／6／9-max 分別是 0.777／0.491／0.453。
+    - 這是設計錯誤：A8 門檻第 4 點已經寫了「改成只有明確要求時才用防守節點」，但我排在通過之後才做，應該在驗收前就做。A8 也受同一個問題影響。
+  - 可能的下一步（未做，需新門檻與新種子）：讓 `lookup` 只有 `defend=True` 時才用防守節點（範圍估計固定用 v8.1 節點），測試確認 adaptive 沒觸發時翻前與翻後都與 v8.1 完全相同（包括範圍估計），再重新驗收。
+
+### A8.2 修正範圍估計後重新驗收（opt-in，`WebRealtimeAgent(adaptive=True)`；2026-10-27 驗收未通過，預設關閉，runtime 維持 v8.1）
+
+- 改動（只改 A8.1 找到的 bug，分類門檻與防守節點都不變）：
+  - `web_preflop.lookup` 與 `web_preflop_v8.lookup` 的 `defend` 預設改成 `False`，只有 `defend=True`（adaptive agent 自己判定要防守時）才用 v8.2 防守節點。範圍估計（`probabilities()`／`ranges()`／`_public_ranges`）和其他所有呼叫端都讀 v8.1 節點。
+  - 因此沒有 adaptive 時，載入 v8.2 表也與 v8.1 完全相同；v8.2 單獨驗收時「一律防守」的行為要回到 commit 0ff1fee 才能重現。
+  - 測試：新增 `test_v82_range_estimates_match_v81`（limp 後跟 iso、平跟後跟 squeeze 兩個情境，v8.1／v8.2 的 `ranges()` 逐一相等）；`test_v82_preflop_is_legal_against_probes` 改成強制每個防守節點都防守。四個測試檔共 123 passed。
+  - A8.1 診斷腳本 `a81_range_check.py` 的 total variation 從 0.453–0.777 變成 0.000。
+  - 實作冒煙（種子 20261105、120 deals，非驗收）：station 9-max、station 3-max、rule 6-max 的 A8.2−v8.1 都正好是 0（含翻後）。
+- **A8.2 驗收門檻（2026-10-26 22:42 CST，執行前訂定，不事後調整）**：與 A8.1 相同，只換種子與標籤。
+  1. `web_policy_ab.py --baseline web_preflop_v8_1.json.gz --candidate web_preflop_v8_2.json.gz --baseline-label v8.1 --candidate-label A8.2 --persistent-models --candidate-adaptive --seconds 2 --seed 20261110`，100 BB，2–9-max × {station, rule, iso, squeeze, nit, tag, lag, maniac} 共 64 組；iso、squeeze 用 `--deals 6000`，其他用 `--deals 3000`。每組 A8.2−v8.1 的 95% CI 上界都 ≥ 0。
+  2. iso＋squeeze 16 組合併：各組 bb/100 平均，SE = √(Σ 各組 SE²)/16，95% CI 下界 > 0。
+  3. 其他對手不要求顯著改善，結果照實記錄。
+  4. 1、2 都通過才算 A8.2 通過。通過後 runtime 改為 v8.2 表（`web_preflop.TABLE_PATH`）加網頁 session 的 `adaptive=True`；沒有 adaptive 的呼叫端行為與 v8.1 相同（上述改動）。不通過則維持 v8.1、預設不啟用，不調整門檻。
+  5. 不重跑固定 Arena：理由同 A8（每手重建 agent、沒有對手資料，與 v8.1 決策完全相同）。
+  - 設計依據與限制：門檻沿用 A8.1，A8.1 的 iso＋squeeze 合併結果（+1.35 [+0.73,+1.97]）已看過，所以換新種子 20261110，A8.1 的數字不算進驗收。只驗 100 BB 與這些模擬對手；64 組中即使無差異也可能有 1–2 組偽失敗，照實記錄。
+  - 輸出 `out/web-realtime/a82-{opponent}-{n}-{deals}.json`，manifest `a82-eval.manifest.txt`，進度 `a82-eval.out`，判定腳本 `a82_gate.py`（scratchpad）。
+- **A8.2 驗收結果（10-26 22:42–23:57，64 組全部完成）：未通過**。A8.2 維持 opt-in、預設關閉，runtime 不變（v8.1）。
+  - 條件 1 **未通過**：lag 6-max −0.15 [−0.25,−0.05]（HJ −0.2 顯著）。其餘 63 組 CI 上界都 ≥ 0。
+  - 條件 2 通過：iso＋squeeze 合併 +1.67 [+1.06,+2.28]。iso 3／5／6／8-max、squeeze 9-max 單組顯著為正。
+  - 範圍估計修正生效：station、nit 16 組全部正好是 0；rule 只有 6／9-max 有極小差異（+0.06、+0.03，不顯著）；tag 只有 7／9-max −0.01（不顯著）。
+  - lag、maniac：除 lag 6-max 外都不顯著；lag 7-max +3.14、maniac 4-max +9.18 接近顯著為正。
+  - **lag 6-max 診斷（用同種子重跑，結果完全相同；`a82_lag6_diag.py`，scratchpad；不改變判定）**：3000 deals 中只有 14 個 deal 有差異，13 個都是 −0.25 BB、1 個 −1.2 BB，合計 −4.45 BB。不是隨機雜訊，而是某個固定情境每次小輸；差異太少使配對 CI 很窄。
+  - **情境（10-27 診斷，`a82_lag6_spots.py`，scratchpad，記錄兩邊英雄每個決策）**：14 個 deal 全部是同一種情境。
+    - 英雄在 LJ／HJ／CO／BTN 用 v8.1 的範圍 open-limp 弱的 offsuit 牌（A3o–A9o、K8o–KTo、Q8o、Q8s），lag 在後面 iso（lag 已被判定為常 iso），通常還有 1–3 人跟注。
+    - v8.1 在這裡全部棄牌；A8.2 進入 `limp_vs_raise:mdf` 跟注 150。
+    - 13 手進入翻後（12 手 3–5 人、1 手 2 人）都沒中，多人翻後 heuristic 不詐唬、equity 不夠就棄牌，全部在翻牌或轉牌棄牌；另 1 手跟注後被別人再加注，翻前棄牌。14 手沒有一手到攤牌或贏。每手多輸 1.5 BB（一個 deal 6 個座位平均就是 −0.25 BB），一手跟了翻牌注再棄多輸 7.2 BB。
+  - **原因**：防守節點用 MDF 的想法（加注者對 capped 範圍加注，要守住一定比例），假設跟注的牌在翻後能實現 equity。但面對 lag（翻後持續下注）加上多人底池，英雄翻後策略只在有足夠 equity 時繼續，弱 offsuit 牌幾乎實現不了 equity。`OTHER_DEFENDER_DECAY`（每多一個其他對手 ×0.75）不足以把這些牌排除。
+  - 證據有限：只有 14 手，且 14 手全輸（若中牌率約 30%，全輸的機率約 0.7%，所以也有運氣成分）。對 iso 探針與其他 lag 桌型，防守點估計多為正。
+
+### A8.3 只在沒人跟注加注時防守（2026-10-27 驗收通過；目前 runtime：v8.2 表＋網頁 session `adaptive=True`）
+
+- 改動（只針對 A8.2 lag 6-max 的情境）：`WebRealtimeAgent._defend` 多一個條件，最後一次加注之後若已有人跟注（多人底池），就不用防守節點，與 v8.1 相同。其餘（分類門檻、防守節點、範圍估計用 v8.1 節點）都不變。
+  - 測試 `test_adaptive_defends_only_while_nobody_called_the_raise`：6-max CO limp、BTN（常 iso）iso，SB 棄牌時防守，SB 跟注時不防守。四個測試檔共 124 passed。
+  - A8.2 lag 6-max 的 14 手中有 13 手在英雄行動前已有人跟注加注，會被排除；只剩 deal 993（只有英雄與加注者）仍會防守。
+- 設計依據與限制：這個條件是看過 A8.2（種子 20261110）結果才加的，所以換新種子 20261111，A8.2 的數字不算進驗收。拿掉多人防守後，對 iso／squeeze 的增益可能變小；A8.2 合併 +1.67、SE 約 0.31，若增益減半（約 +0.8），6000 deals 的檢定力約 74%，所以 iso、squeeze 改用 9000 deals（SE 約 0.25，檢定力約 89%）。
+- **A8.3 驗收門檻（2026-10-27 00:42 CST，執行前訂定，不事後調整）**：
+  1. `web_policy_ab.py --baseline web_preflop_v8_1.json.gz --candidate web_preflop_v8_2.json.gz --baseline-label v8.1 --candidate-label A8.3 --persistent-models --candidate-adaptive --seconds 2 --seed 20261111`，100 BB，2–9-max × {station, rule, iso, squeeze, nit, tag, lag, maniac} 共 64 組；iso、squeeze 用 `--deals 9000`，其他用 `--deals 3000`。每組 A8.3−v8.1 的 95% CI 上界都 ≥ 0。
+  2. iso＋squeeze 16 組合併：各組 bb/100 平均，SE = √(Σ 各組 SE²)/16，95% CI 下界 > 0。
+  3. 其他對手不要求顯著改善，結果照實記錄。
+  4. 1、2 都通過才算 A8.3 通過。通過後 runtime 改為 v8.2 表（`web_preflop.TABLE_PATH`）加網頁 session 的 `adaptive=True`；沒有 adaptive 的呼叫端行為與 v8.1 相同。不通過則維持 v8.1、預設不啟用，不調整門檻。
+  5. 不重跑固定 Arena：理由同 A8。
+  - 限制：只驗 100 BB 與這些模擬對手；64 組中即使無差異也可能有 1–2 組偽失敗；差異很少的組（像 A8.2 lag 6-max 只有 14 個 deal 不同）CI 很窄，只要固定情境小輸就會失敗，照實記錄。
+  - 輸出 `out/web-realtime/a83-{opponent}-{n}-{deals}.json`，manifest `a83-eval.manifest.txt`，進度 `a83-eval.out`，判定腳本 `a83_gate.py`（scratchpad）。
+- **A8.3 驗收結果（10-27 00:42–01:58，64 組全部完成）：通過**。
+  - 條件 1 通過：64 組的 CI 上界都 ≥ 0。
+  - 條件 2 通過：iso＋squeeze 合併 +2.06 [+1.65,+2.48]。
+    - iso（9000 deals）：3–9-max 全部顯著為正，+6.03、+5.45、+4.82、+3.19、+2.22、+2.43、+2.10；2-max −1.67 [−6.39,+3.06] 不顯著。
+    - squeeze（9000 deals）：4–9-max 全部顯著為正，+0.75 到 +2.65；3-max +0.40 不顯著；2-max 是 0（HU 沒有 squeeze）。
+  - station、rule、nit 24 組全部正好是 0；tag 只有 3／4-max −0.03／−0.05（不顯著），其他是 0。
+  - lag 全部不顯著（−0.03 到 +2.87），A8.2 失敗的 6-max 現在 +0.05 [−0.18,+0.29]。maniac 2-max +19.99 [+6.62,+33.36] 顯著為正，其他不顯著。
+  - 比 A8.2 好的原因（推測）：拿掉多人防守後，對 iso／squeeze 的合併增益沒有變小反而變大（+1.67 → +2.06），表示多人底池的防守本來就是虧的。
+- **runtime 已切換（照門檻第 4 點）**：
+  - `web_preflop.TABLE_PATH` 改為 `web_preflop_v8_2.json.gz`。
+  - `backend/api/sessions.py` 的 `_realtime` 改為 `WebRealtimeAgent(..., adaptive=True)`（`station_ranges` 維持關閉）。
+  - 沒有 adaptive 的呼叫端（Arena、舊實驗）因為 `lookup` 預設不用防守節點，行為與 v8.1 完全相同。
+  - 測試 `test_v82_only_adds_defence_nodes_and_is_the_runtime` 檢查以上設定。四個測試檔 124 passed；全專案 pytest 294 passed、2 skipped、1 failed（舊的 Leduc 收斂測試 `test_leduc_value_and_convergence`，NashConv 0.0125 > 0.01，切換前就已失敗，與 v8／A8 無關）。
+- 限制：只驗 100 BB 與這些模擬對手；防守只在同一個網頁 session 中、對手至少 8 次 iso／squeeze 機會且比例 ≥ 50% 後才啟用，對真人的效果未驗證。固定 Arena 沒有重跑（理由見門檻第 5 點）。
+  - 可能的下一步（未做，需新門檻與新種子）：找出 lag 6-max 那 14 個 deal 的情境並修正後再驗收；或接受目前結果，維持 v8.1。
+
 ## 暫停檢查點（2026-10-24 19:43 CST；歷史紀錄）
 
 - 使用者要把計算移到另一台電腦；目前評估程序已按 PID 停止。SIGINT 一度被背景程序忽略，之後對各工作 PID 發 SIGTERM。已確認沒有 web_policy_ab.py、web_realtime_accept.py、Arena runner、網路評估、網站 supervisor 或 vite/uvicorn 程序仍在跑。

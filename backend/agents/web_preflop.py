@@ -18,7 +18,8 @@ from backend.solver.hands import CLASS_NAMES, COMBOS, class_index
 
 from .pushfold import PushFoldAgent, preflop_order
 
-TABLE_PATH = Path(__file__).with_name("data") / "web_preflop_v8_1.json.gz"
+# A8.3 passed (2026-10-27): v8.2 = v8.1 + defence nodes, read only by adaptive agents (defend=True).
+TABLE_PATH = Path(__file__).with_name("data") / "web_preflop_v8_2.json.gz"
 POSITIONS = {
     2: ("BTN/SB", "BB"),
     3: ("BTN", "SB", "BB"),
@@ -138,12 +139,14 @@ def tables() -> dict:
     return data
 
 
-def lookup(view: PlayerView, legal: LegalActions) -> tuple[np.ndarray, dict, str]:
+def lookup(view: PlayerView, legal: LegalActions, defend: bool = False) -> tuple[np.ndarray, dict, str]:
+    """v8.2 defence nodes only with ``defend=True`` (the adaptive agent's own choice); range
+    estimates and every other caller read the v8.1 nodes, so a v8.2 table otherwise plays as v8.1."""
     data = tables()
     if data["schema"] == 2:
         from .web_preflop_v8 import lookup as v8_lookup
 
-        probs, table, key = v8_lookup(view, legal, data)
+        probs, table, key = v8_lookup(view, legal, data, defend)
     else:
         probs, table, key = _v7_lookup(view, legal, data)
     if legal.can_check or not legal.can_fold:

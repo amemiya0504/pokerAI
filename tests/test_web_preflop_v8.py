@@ -283,10 +283,12 @@ def flat_then_squeeze(depth=100):
     return h
 
 
-def test_v82_only_adds_defence_nodes_and_runtime_stays_v81(v82):
+def test_v82_only_adds_defence_nodes_and_is_the_runtime(v82):
     from backend.agents.web_preflop_v8 import DEFEND_GROUPS
+    from backend.api.sessions import _realtime
 
-    assert DEFAULT_PATH == V81_PATH  # v8.2 failed its 2026-10-26 gate
+    # v8.2 failed alone (2026-10-26); A8.3 (adaptive, defend only vs frequent isolators / squeezers) passed
+    assert DEFAULT_PATH == V82_PATH and _realtime(0).adaptive and not _realtime(0).station_ranges
     assert v82["version"] == "web-v8.2-capped-defence" and "not GTO" in v82["source"]
     assert v82["defend_groups"] == list(DEFEND_GROUPS)
     assert set(v82["tables"]) == expected_keys(defend=True)
@@ -301,7 +303,8 @@ def test_limper_facing_raise_and_flatter_facing_squeeze_contexts(v82):
     v, legal = h.observation(h.to_act), h.legal_actions()
     assert context(v, legal, defend=True) == "limp_vs_raise:mdf"
     assert context(v, legal).startswith("vs_open_early_medium:")   # v8.1 tables keep the old node
-    assert lookup(v, legal)[2] == "2/100/BTN/SB/limp_vs_raise:mdf"
+    assert lookup(v, legal, defend=True)[2] == "2/100/BTN/SB/limp_vs_raise:mdf"
+    assert lookup(v, legal)[2].startswith("2/100/BTN/SB/vs_open_early_medium:")   # only on request
 
     h = flat_then_squeeze()
     v, legal = h.observation(h.to_act), h.legal_actions()
@@ -329,7 +332,7 @@ def test_defence_continues_mdf_share_of_the_capped_range(v82):
     h.apply(Action.call())
     h.apply(Action.raise_to(400))
     v, legal = h.observation(h.to_act), h.legal_actions()
-    probs, t, _ = lookup(v, legal)
+    probs, t, _ = lookup(v, legal, defend=True)
     fraction = t["mdf_scale"] * (1 - legal.call_amount / v.pot)
     assert fraction == pytest.approx(.75 * .4)
     cont = 1 / (1 + np.exp(-np.clip((fraction - np.array(t["percentile"])) / DEFEND_SMOOTHING, -60, 60)))
@@ -339,7 +342,7 @@ def test_defence_continues_mdf_share_of_the_capped_range(v82):
     assert (w @ cont) / w.sum() == pytest.approx(fraction, abs=.03)   # v8.1 continued with none of it
 
     v, legal = (h := flat_then_squeeze()).observation(h.to_act), h.legal_actions()
-    probs, _, _ = lookup(v, legal)
+    probs, _, _ = lookup(v, legal, defend=True)
     aa, sevens, trash = (CLASS_NAMES.index(c) for c in ("AA", "77", "72o"))
     assert probs[aa, 2] > .9 and probs[sevens, 1] > .5 and probs[trash, 0] > .99
 
@@ -364,16 +367,18 @@ def test_preflop_probes_attack_capped_ranges():
 
 
 @pytest.mark.parametrize("n", (2, 4, 6, 9))
-def test_v82_preflop_is_legal_against_probes(v82, n):
+def test_v82_preflop_is_legal_against_probes(v82, n, monkeypatch):
     from scripts.experiments.preflop_exploiters import IsoProbe, SqueezeProbe
 
+    monkeypatch.setattr(WebRealtimeAgent, "_defend", lambda self, view, legal: True)  # every defence node
     hit = set()
     for depth in (25, 100):
         for seed in range(12):
             for probe in (IsoProbe, SqueezeProbe):
                 h = table(n, depth, seed)
                 hero = h.seats[seed % n]
-                agents = {s: (WebRealtimeAgent(seed, mode="network") if s == hero else probe(seed + s)) for s in h.seats}
+                agents = {s: (WebRealtimeAgent(seed, mode="network", adaptive=True) if s == hero else probe(seed + s))
+                          for s in h.seats}
                 while not h.is_over and h.street is Street.PREFLOP:
                     v, legal = h.observation(h.to_act), h.legal_actions()
                     decision = agents[v.seat].act(v, legal)
@@ -383,3 +388,134 @@ def test_v82_preflop_is_legal_against_probes(v82, n):
                         hit |= {g for g in ("limp_vs_raise", "flat_vs_squeeze") if g in decision.reason}
                     h.apply(decision.action)
     assert hit, "probes should reach at least one defence node"
+
+
+# ---------------------------------------------------------------- A8 style adaptation (opt-in)
+
+def test_preflop_style_chances_and_hand_over_counts():
+    from backend.agents.web_realtime import STYLE_KEY, preflop_style_chances
+
+    h = hu()
+    h.apply(Action.call())              # BTN/SB limps
+    h.apply(Action.raise_to(400))       # BB isolates
+    h.apply(Action.fold())
+    assert preflop_style_chances(h.observation(0)) == [(1, "iso", True)]
+
+    h = table(6)
+    fold_to(h, "CO")
+    co = h.to_act
+    h.apply(Action.raise_to(250))       # CO opens
+    h.apply(Action.call())              # BTN flats
+    sb = h.to_act
+    h.apply(Action.raise_to(1000))      # SB squeezes; BB then faces a 3-bet, not a squeeze chance
+    while not h.is_over:
+        h.apply(Action.fold())
+    assert preflop_style_chances(h.observation(co)) == [(sb, "squeeze", True)]
+    models = {}
+    WebRealtimeAgent(0, opponent_models=models).hand_over(h.observation(co))
+    assert models[STYLE_KEY] == {sb: [0, 0, 1, 1]}
+
+    h = table(6)
+    fold_to(h, "CO")
+    h.apply(Action.raise_to(250))
+    h.apply(Action.call())              # BTN flats
+    sb = h.to_act
+    h.apply(Action.fold())              # SB passes on the squeeze
+    assert preflop_style_chances(h.observation(co)) == [(sb, "squeeze", False)]
+
+
+def test_adaptive_without_history_plays_exactly_v81(monkeypatch):
+    """Fresh models (the Arena harness) never trigger A8, so its v8.2 table plays as v8.1."""
+    def run(path, adaptive):
+        monkeypatch.setattr(web_preflop, "TABLE_PATH", path)
+        tables.cache_clear()
+        out = []
+        for n in (2, 3, 6, 9):
+            for seed in range(6):
+                h = table(n, 100, seed)
+                agents = {s: WebRealtimeAgent(seed + s, mode="network", adaptive=adaptive) for s in h.seats}
+                while not h.is_over and h.street is Street.PREFLOP:
+                    d = agents[h.to_act].act(h.observation(h.to_act), h.legal_actions())
+                    out.append((d.action, d.reason.split(" ", 3)[3]))
+                    h.apply(d.action)
+        return out
+
+    assert run(V82_PATH, True) == run(V81_PATH, False)
+
+
+def test_v82_range_estimates_match_v81(monkeypatch):
+    """A8.1 failed because ranges() read the defence nodes for a limp-caller or a squeeze-caller."""
+    from backend.agents.pushfold import PushFoldAgent
+
+    h = table(6)
+    fold_to(h, "CO")
+    h.apply(Action.call())              # CO limps
+    h.apply(Action.raise_to(400))       # BTN isolates
+    h.apply(Action.fold())
+    h.apply(Action.fold())
+    h.apply(Action.call())              # CO calls the iso
+    spots = [h, flat_then_squeeze()]
+    spots[1].apply(Action.call())       # BTN calls the squeeze
+    out = {}
+    for path in (V81_PATH, V82_PATH):
+        monkeypatch.setattr(web_preflop, "TABLE_PATH", path)
+        tables.cache_clear()
+        out[path] = [web_preflop.ranges(s.observation(s.to_act), PushFoldAgent(0)) for s in spots]
+    for a, b in zip(out[V81_PATH], out[V82_PATH]):
+        assert a.keys() == b.keys() and all(np.array_equal(a[s], b[s]) for s in a)
+
+
+def test_adaptive_defends_only_against_a_frequent_isolator(v82):
+    from backend.agents.web_realtime import AGGRESSIVE_MIN_CHANCES, STYLE_KEY
+
+    h = hu()
+    h.apply(Action.call())
+    h.apply(Action.raise_to(400))
+    v, legal = h.observation(h.to_act), h.legal_actions()
+    bb = next(s.seat for s in v.seats if s.seat != v.seat)
+    n = AGGRESSIVE_MIN_CHANCES
+    for counts, node in (([n, n, 0, 0], "limp_vs_raise:mdf"), ([n, 1, 0, 0], "vs_open_early_medium"),
+                         ([n - 1, n - 1, 0, 0], "vs_open_early_medium"), ([0, 0, n, n], "vs_open_early_medium")):
+        agent = WebRealtimeAgent(0, mode="network", adaptive=True, opponent_models={STYLE_KEY: {bb: counts}})
+        assert node in agent.act(v, legal).reason, counts
+
+
+def test_adaptive_defends_only_while_nobody_called_the_raise(v82):
+    """A8.2 lost every multiway limp_vs_raise defence vs lag 6-max (weak offsuit hands folded postflop)."""
+    from backend.agents.web_realtime import AGGRESSIVE_MIN_CHANCES, STYLE_KEY
+
+    n = AGGRESSIVE_MIN_CHANCES
+    for sb_calls in (False, True):
+        h = table(6)
+        fold_to(h, "CO")
+        h.apply(Action.call())              # CO limps
+        btn = h.to_act
+        h.apply(Action.raise_to(400))       # BTN isolates
+        h.apply(Action.call() if sb_calls else Action.fold())
+        h.apply(Action.fold())              # BB
+        v, legal = h.observation(h.to_act), h.legal_actions()
+        assert position(v) == "CO"
+        agent = WebRealtimeAgent(0, mode="network", adaptive=True, opponent_models={STYLE_KEY: {btn: [n, n, 0, 0]}})
+        assert agent._defend(v, legal) is not sb_calls
+        assert ("limp_vs_raise:mdf" in agent.act(v, legal).reason) is not sb_calls
+
+
+def test_station_ranges_only_when_explicitly_enabled():
+    from backend.agents import web_realtime
+    from backend.opponent.model import OpponentModel
+
+    h = table(3)
+    while h.street is Street.PREFLOP:
+        h.apply(Action.check() if h.legal_actions().can_check else Action.call())
+    v, legal = h.observation(h.to_act), h.legal_actions()
+    others = [s.seat for s in v.seats if s.seat != v.seat]
+    station, tight = OpponentModel(), OpponentModel()
+    station.counts = {"vpip": {"BTN": [40, 5]}, "pfr": {"BTN": [1, 44]}}
+    tight.counts = {"vpip": {"BTN": [10, 35]}, "pfr": {"BTN": [8, 37]}}
+    models = {others[0]: station, others[1]: tight}
+    assert web_realtime.WebRealtimeAgent(0, adaptive=True, opponent_models=models)._station_seats(v) == {others[0]}
+    d = web_realtime.WebRealtimeAgent(0, mode="network", adaptive=True, station_ranges=True, opponent_models=models).act(v, legal)
+    assert f"station-like seats [{others[0]}]" in d.reason
+    for kwargs in ({"adaptive": True}, {}):  # A8.1 dropped A8's station range switch
+        d = web_realtime.WebRealtimeAgent(0, mode="network", opponent_models=models, **kwargs).act(v, legal)
+        assert "station-like" not in d.reason

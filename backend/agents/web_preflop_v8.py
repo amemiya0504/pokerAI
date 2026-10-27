@@ -191,8 +191,8 @@ def validate(data: dict) -> None:
             raise ValueError(f"invalid sizing in {k}")
 
 
-def lookup(view: PlayerView, legal: LegalActions, data: dict) -> tuple[np.ndarray, dict, str]:
-    k = key(view, legal, "defend_groups" in data)
+def lookup(view: PlayerView, legal: LegalActions, data: dict, defend: bool = False) -> tuple[np.ndarray, dict, str]:
+    k = key(view, legal, defend and "defend_groups" in data)
     table = data["tables"][k]
     if k.endswith(":allin"):
         probs = allin_probs(view, legal, table)

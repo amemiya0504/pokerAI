@@ -7,15 +7,22 @@ from functools import lru_cache
 
 import numpy as np
 
-from backend.engine.actions import Action, LegalActions
+from backend.engine.actions import Action, ActionType, LegalActions
 from backend.engine.cards import derive_seed
-from backend.engine.hand import PlayerView, Street
+from backend.engine.hand import EventType, PlayerView, Street
 from backend.solver.hands import class_index
 
 from .base import Decision, StrategySource
 from .pushfold import PushFoldAgent
 from .realtime import RealtimeAgent, strength_percentile
 from .web_preflop import effective_bb, lookup, ranges, tables
+
+# Style adaptation (A8.1, opt-in): thresholds fixed before its gate; HEURISTIC, not an exploit solver.
+# opponent_models[STYLE_KEY][seat] = [iso chances, isos, squeeze chances, squeezes]
+STYLE_KEY = "preflop_style"
+# A8's station range switch failed its gate; kept behind station_ranges=True only to reproduce A8.
+STATION_MIN_HANDS, STATION_VPIP, STATION_PFR = 30, .40, .08
+AGGRESSIVE_MIN_CHANCES, AGGRESSIVE_RATE = 8, .50
 
 
 @lru_cache(maxsize=64)
@@ -36,7 +43,7 @@ def _public_ranges(view: PlayerView) -> dict[int, np.ndarray]:
     return weights
 
 
-def equity(view: PlayerView, samples: int = 192) -> float:
+def equity(view: PlayerView, samples: int = 192, uniform_seats: frozenset = frozenset()) -> float:
     """Range-vs-range CPU Monte Carlo with card blockers and split-pot equity."""
     from backend.engine.fast_eval import CARD_A, CARD_B, evaluate_many
 
@@ -44,6 +51,8 @@ def equity(view: PlayerView, samples: int = 192) -> float:
     if not opponents:
         return 1.0
     weights = _public_ranges(view)
+    for seat in uniform_seats:  # their actions say little about their cards (A8)
+        weights[seat] = np.ones(1326)
     missing = 5 - len(view.board)
     rng = np.random.default_rng(derive_seed(37, *view.hole_cards, *view.board, len(opponents)))
     holes = np.empty((samples, len(opponents), 2), dtype=np.int64)
@@ -125,9 +134,9 @@ def _multiway_bluff(view: PlayerView, legal: LegalActions, eq: float) -> dict[st
 
 
 def heuristic(view: PlayerView, legal: LegalActions, rng: random.Random | None = None,
-              allow_bluff: bool = False) -> Decision:
+              allow_bluff: bool = False, uniform_seats: frozenset = frozenset()) -> Decision:
     n = sum(not s.folded for s in view.seats)
-    eq = equity(view)
+    eq = equity(view, uniform_seats=uniform_seats) if uniform_seats else equity(view)
     price = legal.call_amount / max(1, view.pot + legal.call_amount)
     # shortcut: call EV assumes showdown equity realizes fully; upgrade when multi-street realization is modeled.
     call_ev = eq * (view.pot + legal.call_amount) - legal.call_amount
@@ -157,6 +166,8 @@ def heuristic(view: PlayerView, legal: LegalActions, rng: random.Random | None =
         action = Action.check() if legal.can_check else Action.call()
     action_ev = {"check": bluff["check_ev"], "raise": bluff["ev"]} if bluff else None
     reason = f"HEURISTIC multiway ({n} live): range equity {eq:.3f}, price {price:.3f}, call EV {call_ev:.1f}"
+    if uniform_seats:
+        reason += f"; uniform ranges for station-like seats {sorted(uniform_seats)}"
     if bluff:
         reason += (f"; estimated bluff mix {raising:.3f}, fold equity {bluff['fold_equity']:.3f}, "
                    f"blocker delta {bluff['blocker_delta']:.3f}, EV {bluff['ev']:.1f}")
@@ -186,23 +197,85 @@ class _WebHeadsUp(RealtimeAgent):
         return super()._network_decision(view, legal, st, ranges, me, oop, ip, hero, street, why)
 
 
+def preflop_style_chances(view: PlayerView) -> list[tuple[int, str, bool]]:
+    """(seat, "iso" | "squeeze", took it) for each first preflop decision facing limpers / an open plus callers."""
+    out, raises, limpers, callers, acted = [], 0, 0, 0, set()
+    for e in view.history:
+        if e.type is not EventType.ACTION or e.street is not Street.PREFLOP:
+            continue
+        aggressive = e.action in (ActionType.BET, ActionType.RAISE)
+        if e.seat not in acted:
+            if raises == 0 and limpers:
+                out.append((e.seat, "iso", aggressive))
+            elif raises == 1 and callers:
+                out.append((e.seat, "squeeze", aggressive))
+        acted.add(e.seat)
+        if aggressive:
+            raises, callers = raises + 1, 0
+        elif e.action is ActionType.CALL:
+            limpers += raises == 0
+            callers += raises == 1
+    return out
+
+
 class WebRealtimeAgent:
     def __init__(self, seed: int = 0, seconds: float = 10.0, mode: str = "solve",
-                 opponent_models: dict | None = None, multiway_bluff: bool = False) -> None:
+                 opponent_models: dict | None = None, multiway_bluff: bool = False, adaptive: bool = False,
+                 station_ranges: bool = False) -> None:
         if mode not in ("solve", "network"):
             raise ValueError("mode must be 'solve' or 'network'")
         self.seed, self.seconds, self.mode = seed, seconds, mode
         self.opponent_models = opponent_models if opponent_models is not None else {}
         self.multiway_bluff = multiway_bluff
+        self.adaptive = adaptive
+        self.station_ranges = station_ranges
         self._rng = random.Random(seed)
         self._pushfold = PushFoldAgent(seed)
         self._hu = None
+
+    def _aggressive(self, seat: int, kind: str) -> bool:
+        counts = self.opponent_models.get(STYLE_KEY, {}).get(seat)
+        if counts is None:
+            return False
+        chances, took = counts[0:2] if kind == "iso" else counts[2:4]
+        return chances >= AGGRESSIVE_MIN_CHANCES and (took + 1) / (chances + 2) >= AGGRESSIVE_RATE
+
+    def _station_seats(self, view: PlayerView) -> frozenset:
+        out = set()
+        for s in view.seats:
+            model = self.opponent_models.get(s.seat) if s.seat != view.seat and not s.folded else None
+            if model is None:
+                continue
+            vpip_yes, vpip_no = model.total("vpip")
+            pfr_yes, pfr_no = model.total("pfr")
+            hands = vpip_yes + vpip_no
+            if (hands >= STATION_MIN_HANDS and vpip_yes / hands >= STATION_VPIP
+                    and pfr_yes / max(1, pfr_yes + pfr_no) <= STATION_PFR):
+                out.add(s.seat)
+        return frozenset(out)
+
+    def _defend(self, view: PlayerView, legal: LegalActions) -> bool:
+        """Use v8.2's capped-range defence only against a raiser seen to iso / squeeze often, and only
+        while nobody else has called that raise (A8.3: multiway, weak defenders folded postflop)."""
+        from .web_preflop_v8 import DEFEND_GROUPS, context
+
+        group = context(view, legal, defend=True).split(":")[0]
+        if group not in DEFEND_GROUPS:
+            return False
+        actions = [e for e in view.history if e.type is EventType.ACTION and e.street is Street.PREFLOP]
+        last = max(i for i, e in enumerate(actions) if e.action in (ActionType.BET, ActionType.RAISE))
+        if any(e.action is ActionType.CALL for e in actions[last + 1:]):
+            return False
+        return self._aggressive(actions[last].seat, "iso" if group == "limp_vs_raise" else "squeeze")
 
     def act(self, view: PlayerView, legal: LegalActions) -> Decision:
         if view.street is Street.PREFLOP:
             if 5 <= effective_bb(view) <= 20 and not isinstance(self._pushfold._lookup(view), str):
                 return self._pushfold.act(view, legal)
-            probs, table, key = lookup(view, legal)
+            if self.adaptive and "defend_groups" in tables():
+                probs, table, key = lookup(view, legal, defend=self._defend(view, legal))
+            else:
+                probs, table, key = lookup(view, legal)
             row = probs[class_index(*view.hole_cards)]
             q = self._rng.random()
             if q < row[0]:
@@ -221,6 +294,9 @@ class WebRealtimeAgent:
                             action_probs={"fold": float(row[0]), "check" if legal.can_check else "call": float(row[1]), "raise": float(row[2])},
                             reason=f"frozen preflop {tables()['version']} {key}; HEURISTIC, not GTO")
         if len(view.seats) != 2:
+            stations = self._station_seats(view) if self.adaptive and self.station_ranges else frozenset()
+            if stations:
+                return heuristic(view, legal, self._rng, self.multiway_bluff, uniform_seats=stations)
             return heuristic(view, legal, self._rng, self.multiway_bluff)
         if self._hu is None:
             # M9's reference describes its old preflop policy; it cannot calibrate this policy.
@@ -236,3 +312,10 @@ class WebRealtimeAgent:
         for seat in hand.start_stacks:
             if seat != view.seat:
                 self.opponent_models.setdefault(seat, OpponentModel()).observe(hand, seat)
+        style = self.opponent_models.setdefault(STYLE_KEY, {})
+        for seat, kind, took in preflop_style_chances(view):
+            if seat != view.seat:
+                counts = style.setdefault(seat, [0, 0, 0, 0])
+                i = 0 if kind == "iso" else 2
+                counts[i] += 1
+                counts[i + 1] += took
