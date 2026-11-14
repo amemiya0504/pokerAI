@@ -1,10 +1,10 @@
 """Preflop push/fold equilibria for 2-9 players (an abstracted preflop game).
 
 Game: every player has the same effective stack S (in big blinds); blinds
-0.5/1, no ante. Players act once in preflop order (UTG .. SB, BB). Until
+0.5/1 and an optional equal ante per player. Players act once in preflop order (UTG .. SB, BB). Until
 someone moves all-in, a player may fold or push; after the first push each
 later player may fold or call all-in. If everyone folds to the big blind it
-wins the small blind. All-ins run to a showdown, so payoffs are exact chip
+wins the small blind and the antes. All-ins run to a showdown, so payoffs are exact chip
 EV: there is no model of postflop play to approximate.
 
 Solver: external-sampling Monte Carlo CFR with linear weighting, run in
@@ -48,13 +48,16 @@ def positions(n: int) -> tuple[str, ...]:
 @dataclass(frozen=True)
 class PushFoldGame:
     players: int
-    stack_bb: float
+    stack_bb: float  # starting stack, before the ante and blinds are posted
+    ante_bb: float = 0.0  # paid by every player, dead (does not count toward calling)
 
     def __post_init__(self) -> None:
         if not 2 <= self.players <= 9:
             raise ValueError("players must be 2..9")
-        if self.stack_bb <= 1:
-            raise ValueError("stack must exceed the big blind")
+        if self.ante_bb < 0:
+            raise ValueError("ante must be non-negative")
+        if self.stack_bb <= 1 + self.ante_bb:
+            raise ValueError("stack must exceed the big blind plus the ante")
 
     @property
     def blinds(self) -> list[float]:
@@ -94,21 +97,21 @@ class _Traverser:
     def __init__(self, game: PushFoldGame) -> None:
         self.n = game.players
         self.s = float(game.stack_bb)
-        self.blinds = game.blinds
+        self.forced = [b + game.ante_bb for b in game.blinds]  # chips lost by folding
         keys = game.infosets()
         self.index = {k: i for i, k in enumerate(keys)}
         self.n_inf = len(keys)
 
     def payoff(self, t: int, f: int, mask: int, scores: list[int]) -> float:
-        n, blinds, s = self.n, self.blinds, self.s
+        n, forced, s = self.n, self.forced, self.s
         if f < 0:  # everyone folded to the big blind
-            return 0.5 if t == n - 1 else -blinds[t]
+            return sum(forced) - forced[t] if t == n - 1 else -forced[t]
         players = [f] + [i for i in range(n) if mask >> i & 1]
         if t not in players:
-            return -blinds[t]
+            return -forced[t]
         if len(players) == 1:
-            return sum(blinds) - blinds[f]
-        pot = s * len(players) + sum(blinds[i] for i in range(n) if i not in players)
+            return sum(forced) - forced[f]
+        pot = s * len(players) + sum(forced[i] for i in range(n) if i not in players)
         best = max(scores[i] for i in players)
         winners = [i for i in players if scores[i] == best]
         return (pot / len(winners) if t in winners else 0.0) - s
@@ -225,9 +228,8 @@ class PushFoldSolver:
     def solve(self, request: SolveRequest, progress=None) -> SolveResult:
         if request.game != "pushfold":
             raise ValueError(f"PushFoldSolver cannot solve {request.game!r}")
-        game = PushFoldGame(int(request.params["players"]), float(request.params["stack_bb"]))
-        if request.params.get("ante", 0):
-            raise ValueError("antes are not supported yet")
+        game = PushFoldGame(int(request.params["players"]), float(request.params["stack_bb"]),
+                            float(request.params.get("ante", 0)))
         cfg = request.solver
         batches = int(cfg.get("batches", 200))
         deals_per_batch = int(cfg.get("deals_per_batch", 20_000))
@@ -329,7 +331,7 @@ class PushFoldSolver:
             seconds=time.perf_counter() - t0,
             strategy_source=StrategySource.SOLVER_APPROX,
             notes=[
-                "Abstracted game: push/fold only, equal stacks, blinds 0.5/1, no ante.",
+                f"Abstracted game: push/fold only, equal stacks, blinds 0.5/1, ante {game.ante_bb:g} bb per player.",
                 "Chip EV (no ICM). Approximate equilibrium; not exact GTO for full no-limit play.",
                 "Cells with few visits are rarely reached and less converged; see 'visits'.",
             ],
@@ -444,6 +446,7 @@ def hu_cfr_plus(E: np.ndarray, W: np.ndarray, stack_bb: float, iterations: int =
     return sum_push / norm, sum_call / norm
 
 
-def request(players: int, stack_bb: float, **solver: Any) -> SolveRequest:
+def request(players: int, stack_bb: float, ante: float = 0, **solver: Any) -> SolveRequest:
+    """``ante``: per player, in big blinds."""
     return SolveRequest("pushfold", {"players": players, "stack_bb": stack_bb,
-                                     "small_blind_bb": 0.5, "ante": 0}, solver)
+                                     "small_blind_bb": 0.5, "ante": ante}, solver)

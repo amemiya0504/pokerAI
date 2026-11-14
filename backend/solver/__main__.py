@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from .pushfold import PushFoldSolver, request
-from .store import PUSHFOLD_DIR, record, write
+from .store import PUSHFOLD_DIR, file_name, record, write
 
 
 def _range(text: str) -> list[int]:
@@ -42,6 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     pf.add_argument("--seed", type=int, default=1)
     pf.add_argument("--workers", type=int)
     pf.add_argument("--out", default=str(PUSHFOLD_DIR))
+    pf.add_argument("--ante", type=float, default=0.0, help="ante per player in big blinds (use its own --out)")
+    pf.add_argument("--skip-existing", action="store_true", help="keep datasets already in --out (resume a run)")
     pf.add_argument("--db", help="register datasets and cache results in this database")
     sm = sub.add_parser("small", help="Kuhn or Leduc with exact exploitability")
     sm.add_argument("game", choices=["kuhn", "leduc"])
@@ -78,8 +80,10 @@ def main(argv: list[str] | None = None) -> int:
     solver = PushFoldSolver(args.workers)
     for players in _range(args.players):
         for stack in [float(x) for x in args.stacks.split(",")]:
+            if args.skip_existing and (Path(args.out) / file_name(players, stack)).exists():
+                continue
             deals = args.deals or default_deals(players)
-            req = request(players, stack, batches=args.batches,
+            req = request(players, stack, ante=args.ante, batches=args.batches,
                           deals_per_batch=-(-deals // args.batches),
                           eval_deals=args.eval_deals, seed=args.seed)
             t0 = time.perf_counter()

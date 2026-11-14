@@ -2,7 +2,9 @@
 
     python -m backend.arena rule random station --deals 2000 --seed 1 --out out/arena/run1
 
-Agents are ``kind`` or ``name=kind`` (kinds: random, station, rule); repeat a
+Agents are ``kind`` or ``name=kind`` (kinds: random, station, rule, realtime,
+neural, pushfold, style-nit / -tag / -lag / -station / -maniac, net-linear /
+-mlp-small / -mlp / -resmlp / -cnn / -rnn / -lstm / -transformer); repeat a
 kind with distinct names, e.g. ``a=rule b=rule``.
 """
 

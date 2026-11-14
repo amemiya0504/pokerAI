@@ -51,6 +51,7 @@ export interface TableSeat {
   stack: number
   away: boolean
   in_hand: boolean
+  strategy?: { label: string; street: string } | null
 }
 
 export interface Snapshot {
@@ -66,6 +67,8 @@ export interface Snapshot {
   hand: HandView | null
   legal: Legal | null
   can_rebuy: boolean
+  can_replay: boolean
+  is_replay: boolean
 }
 
 export interface GameSummary {
@@ -133,6 +136,7 @@ export const api = {
 
 export type Command =
   | { type: 'start_hand' }
+  | { type: 'replay_hand' }
   | { type: 'rebuy' }
   | { type: 'set_delay'; seconds: number }
   | { type: 'action'; action: string; amount?: number }

@@ -5,6 +5,7 @@
     python -m backend.policy train out/policy/v1v2.npz out/policy/run1 --db sqlite:///poker.db
     python -m backend.policy benchmark out/policy/run1/model.pt
     python -m backend.policy exploit out/policy/run1/model.pt --spots 100
+    python -m backend.policy depth-bias --spots 8 --out out/policy/flop_depth_limit_bias.json
 
 ``train`` resumes from ``<run>/checkpoint.pt`` when it exists (same config).
 """
@@ -25,7 +26,8 @@ def register(db_url: str, run_dir: Path, report: dict) -> int:
     upgrade(db_url)
     with make_sessionmaker(make_engine(db_url))() as db:
         mv = ModelVersion(
-            arch={"type": "PolicyNet", **{k: report["config"][k] for k in ("hidden", "layers", "range_dim", "dropout")}},
+            arch={"type": "PolicyNet", **report.get("model_config", {k: report["config"][k] for k in
+                                                                     ("hidden", "layers", "range_dim", "dropout")})},
             checkpoint_path=str(run_dir / "model.pt"),
             dataset_ids=[f"{d['dataset']}/{d['version']}" for d in datasets],
             metrics={k: report[k] for k in ("test", "baselines", "targets", "meets_targets", "best_epoch")},
@@ -71,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--range-dim", type=int, default=64)
     t.add_argument("--dropout", type=float, default=0.0)
     t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--arch", default="mlp", choices=["mlp", "linear", "resmlp", "cnn", "rnn", "lstm", "transformer"])
+    t.add_argument("--heads", type=int, default=4, help="transformer attention heads")
+    t.add_argument("--channels", type=int, default=32, help="cnn convolution channels")
     t.add_argument("--device")
     t.add_argument("--db", help="register the model version and training run here")
     e = sub.add_parser("exploit", help="exact exploitability of the network's policy on test spots")
@@ -80,6 +85,11 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--spots", type=int, default=100, help="how many test spots to measure")
     e.add_argument("--streets", default="river,turn")
     e.add_argument("--out", type=Path, help="write per-spot results and the summary as JSON")
+    d = sub.add_parser("depth-bias", help="depth-limited vs full flop solves on small trees")
+    d.add_argument("--seed", type=int, default=5)
+    d.add_argument("--spots", type=int, default=8)
+    d.add_argument("--depths", default="1,2")
+    d.add_argument("--out", type=Path, help="write per-spot results and the summary as JSON")
     b = sub.add_parser("benchmark")
     b.add_argument("model", type=Path)
     b.add_argument("--decisions", type=int, default=50)
@@ -94,7 +104,8 @@ def main(argv: list[str] | None = None) -> int:
         from .train import TrainConfig, train
 
         cfg = TrainConfig(args.features, args.epochs, args.batch_size, args.lr, args.weight_decay,
-                          args.hidden, args.layers, args.range_dim, args.dropout, args.seed)
+                          args.hidden, args.layers, args.range_dim, args.dropout, args.seed, args.arch, args.heads,
+                          args.channels)
         report = train(cfg, args.run, args.device)
         print(json.dumps({k: report[k] for k in ("test", "baselines", "targets", "meets_targets", "best_epoch")},
                          indent=2, default=float))
@@ -103,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "exploit":
         return _exploit(args)
+    if args.cmd == "depth-bias":
+        return _depth_bias(args)
     from .infer import PolicyRunner, benchmark
 
     runner = PolicyRunner(args.model, device="cpu")
@@ -137,6 +150,32 @@ def _exploit(args) -> int:
         results.append(evaluate_spot(spot, policy))
         r = results[-1]
         print(f"spot {idx} {r.street}: solver {r.solver_pct_pot:.2f}% pot, network {r.policy_pct_pot:.2f}% pot",
+              file=sys.stderr, flush=True)
+        if len(results) >= args.spots:
+            break
+    summary = summarize(results)
+    print(json.dumps(summary, indent=2))
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps({"summary": summary, "spots": [asdict(r) for r in results]}, indent=2))
+    return 0
+
+
+def _depth_bias(args) -> int:
+    import time
+    from dataclasses import asdict
+
+    from .depth_bias import bias_spots, evaluate_spot, summarize
+
+    depths = tuple(int(x) for x in args.depths.split(","))
+    results = []
+    for spot in bias_spots(args.seed):
+        t0 = time.perf_counter()
+        r = evaluate_spot(spot, depths)
+        results.append(r)
+        parts = " | ".join(f"depth{d} TV {m['root_tv']:.3f}, vs full {m['vs_full_pct_pot']:+.2f}%, "
+                           f"expl {m['exploitability_pct_pot']:.2f}%" for d, m in r.depth.items())
+        print(f"{r.board} SPR {r.spr:.0f}: full {r.full_pct_pot:.2f}% | {parts} ({time.perf_counter() - t0:.0f}s)",
               file=sys.stderr, flush=True)
         if len(results) >= args.spots:
             break

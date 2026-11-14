@@ -118,17 +118,19 @@ def test_play_full_hands(server, browser, device):
         assert state is not None and session.table.hand_no == hand_no
         hero = session.human_seat
         hero_cards = {card_str(c) for c in state.hole_cards(hero)}
-        shown = state.result().showdown
         board = {card_str(c) for c in state.board}
         for seat in state.seats:
             if seat == hero:
                 continue
             hidden = {card_str(c) for c in state.hole_cards(seat)}
+            terminal_cards: set[str] = set()
             for payload in frames:
                 cards, over = frame_cards(payload)
-                if seat in shown and over:
-                    continue
-                assert not hidden & cards, f"seat {seat}'s cards reached the browser"
+                if over:
+                    terminal_cards |= cards
+                else:
+                    assert not hidden & cards, f"seat {seat} cards reached the browser before the hand ended"
+            assert hidden <= terminal_cards, f"seat {seat} cards were not revealed after the hand ended"
             for seen in dom_leaks:
                 assert not hidden & seen, f"seat {seat}'s cards rendered during play"
         for seen in dom_leaks:

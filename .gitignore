@@ -7,3 +7,4 @@ out/
 poker.db
 frontend/node_modules/
 frontend/dist/
+ai_sessions/

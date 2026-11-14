@@ -78,8 +78,14 @@ def test_training_learns_and_resume_is_exact(features, tmp_path):
         train(tcfg(features, seed=5), tmp_path / "resumed", device="cpu", log=lambda *a: None)
 
 
-def test_inference_matches_training_features(features, tmp_path):
-    train(tcfg(features), tmp_path / "run", device="cpu", resume=False, log=lambda *a: None)
+@pytest.mark.parametrize("arch", ["mlp", "linear", "resmlp", "cnn", "rnn", "lstm", "transformer"])
+def test_inference_matches_training_features(features, tmp_path, arch):
+    """Every architecture: trains, loads from model.pt, and inference equals
+    the training forward pass on the same samples."""
+    report = train(tcfg(features, arch=arch, heads=2, channels=8, layers=2), tmp_path / "run", device="cpu",
+                   resume=False, log=lambda *a: None)
+    assert report["model_config"]["arch"] == arch and report["parameters"] > 0
+    assert report["test"]["kl_nats"] < report["baselines"]["uniform"]["kl_nats"]
     runner = PolicyRunner(tmp_path / "run" / "model.pt")
     import pyarrow.parquet as pq
 
@@ -168,3 +174,18 @@ def test_head_to_head_is_zero_against_itself_and_positive_against_uniform():
     assert head_to_head(spot, solved, solved, cfr, 0.0).a_advantage_chips == pytest.approx(0, abs=1e-9)
     uniform = lambda ctx: np.full((len(ctx["actions"]), len(ctx["combos"])), 1 / len(ctx["actions"]))  # noqa: E731
     assert head_to_head(spot, solved, uniform, cfr, 0.0).a_advantage_chips > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="full flop trees are too slow on the CPU")
+def test_depth_bias_tool_is_zero_when_the_depth_limit_covers_every_street():
+    """Depth 3 on the flop is the full tree: same strategy, no edge, same
+    exploitability. Depth 1 must differ."""
+    from backend.policy.depth_bias import bias_spots, evaluate_spot
+
+    spot = next(bias_spots(max_spr=1))
+    r = evaluate_spot(spot, (1, 3), full_target_pct_pot=0.0, full_max_iterations=60, depth_iterations=60)
+    assert r.full_iterations == 60
+    assert r.depth[3]["root_tv"] < 1e-6
+    assert r.depth[3]["vs_full_pct_pot"] == pytest.approx(0, abs=1e-4)
+    assert r.depth[3]["exploitability_pct_pot"] == pytest.approx(r.full_pct_pot, rel=1e-4, abs=1e-4)
+    assert r.depth[1]["root_tv"] > 0.01

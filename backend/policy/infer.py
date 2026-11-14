@@ -17,13 +17,13 @@ import torch
 from backend.solver.subgame import CARD_A, CARD_B
 
 from .features import SLOT, BoardFeatures, action_slots, board_features, legal_mask, node_numeric, normalise, range_histograms
-from .model import PolicyNet
+from .model import build_model
 
 
 class PolicyRunner:
     def __init__(self, model_path: str | Path, device: str = "cpu", cache_boards: int = 64) -> None:
         state = torch.load(model_path, map_location=device, weights_only=False)
-        self.model = PolicyNet(**state["model_config"]).to(device).eval()
+        self.model = build_model(state["model_config"]).to(device).eval()
         self.model.load_state_dict(state["model"])
         self.device = torch.device(device)
         self.report = state.get("report")

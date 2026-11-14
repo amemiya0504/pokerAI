@@ -7,6 +7,7 @@ export interface FeltSeat {
   name: string
   stack: number // used when the seat is not in the hand
   away?: boolean
+  strategy?: string
 }
 
 interface Props {
@@ -77,6 +78,7 @@ export function TableFelt({ seats, view, heroSeat, lastActions = {} }: Props) {
                 )}
                 <div className="truncate font-medium">{s.name}</div>
                 <div className="tabular-nums opacity-90">{chips(st ? st.stack : s.stack)}</div>
+                {s.strategy && <div className="max-w-36 text-[9px] sm:text-[10px]" data-testid={`strategy-${s.seat}`}>{s.strategy}</div>}
                 {(st?.all_in || st?.folded || lastActions[s.seat] || won) && (
                   <div className="text-[10px] sm:text-xs font-semibold">
                     {won ? `+${chips(won)}` : st?.all_in ? '全下' : st?.folded ? '棄牌' : lastActions[s.seat]}

@@ -203,8 +203,125 @@ def test_cannot_act_after_hand_is_over():
         h.apply(Action.check())
 
 
-def test_ante_is_reserved():
+def test_ante_zero_preserves_blinds_only_behavior():
     from backend.engine.cards import Deck
 
-    with pytest.raises(NotImplementedError):
-        HandState({0: 100, 1: 100}, 0, 1, 2, Deck(0), ante=1)
+    h = HandState({0: 100, 1: 100}, 0, 1, 2, Deck(0), ante=0)
+    assert h.ante == 0 and h.pot == 3
+    assert [e.type for e in h.events] == [EventType.POST_BLIND, EventType.POST_BLIND]
+
+
+def test_ante_is_total_contribution_but_not_street_bet_and_short_stack_is_all_in():
+    from backend.engine.cards import Deck
+
+    h = HandState({0: 25, 1: 1000, 2: 1000}, button=0, small_blind=50,
+                  big_blind=100, deck=Deck(4), ante=50)
+    assert h.ante == 50
+    assert h.stack(0) == 0 and h.total_bet(0) == 25 and h.street_bet(0) == 0
+    assert h.stack(1) == 900 and h.total_bet(1) == 100 and h.street_bet(1) == 50
+    assert h.stack(2) == 850 and h.total_bet(2) == 150 and h.street_bet(2) == 100
+    assert h.pot == 275
+    assert [e.type for e in h.events[:3]] == [EventType.POST_ANTE] * 3
+    assert h.to_act == 1
+
+
+def test_ante_contributions_are_included_in_main_and_side_pots():
+    h = make_hand({0: 50, 1: 1000, 2: 1000}, button=2, ante=100,
+                  holes={0: "AsAh", 1: "KsKh", 2: "QsQh"}, board="2c7d9hJc3s")
+    play(h, "c", "x")
+    while not h.is_over:
+        legal = h.legal_actions()
+        h.apply(Action.check() if legal.can_check else Action.call())
+    result = h.result()
+    assert [(p.amount, p.eligible) for p in result.pots] == [(150, (0, 1, 2)), (300, (1, 2))]
+    assert dict(result.final_stacks) == {0: 150, 1: 1100, 2: 800}
+
+def test_empty_button_uses_explicit_blinds_and_physical_seat_order():
+    from backend.engine.cards import Deck
+
+    h = HandState({1: 1000, 3: 1000, 5: 1000}, 2, 50, 100, Deck(9),
+                  blind_seats=(3, 5))
+    assert (h.sb_seat, h.bb_seat, h.to_act) == (3, 5, 1)
+    assert h.observation(None).sb_seat == 3
+    assert h.observation(None).bb_seat == 5
+    with pytest.raises(ValueError, match="explicit"):
+        HandState({1: 1000, 3: 1000, 5: 1000}, 2, 50, 100, Deck(9))
+
+
+def test_forced_live_and_dead_posts_and_short_stack_contributions():
+    from backend.engine.cards import Deck
+
+    h = HandState({1: 320, 3: 1000, 5: 1000}, 2, 50, 100, Deck(10),
+                  blind_seats=(3, 5), forced_posts={1: (100, 50)})
+    assert h.street_bet(1) == 100 and h.total_bet(1) == 150
+    assert h.stack(1) == 170
+    assert h.street_bet(3) == 50 and h.street_bet(5) == 100
+    assert h.current_bet == 100
+    assert h.to_act == 1
+    assert h.pot == 300
+    posts = [(e.type, e.seat, e.amount) for e in h.events
+             if e.type in (EventType.POST_LIVE, EventType.POST_DEAD)]
+    assert posts == [(EventType.POST_LIVE, 1, 100), (EventType.POST_DEAD, 1, 50)]
+    assert h.observation(None).forced_posts == {1: (100, 50)}
+
+    short = HandState({1: 120, 3: 1000, 5: 1000}, 2, 50, 100, Deck(11),
+                      blind_seats=(3, 5), forced_posts={1: (100, 50)})
+    assert short.street_bet(1) == 100 and short.total_bet(1) == 120
+    assert short.stack(1) == 0
+    assert short.pot == 270
+
+def test_dead_forced_post_does_not_create_a_self_only_side_pot():
+    from backend.engine.cards import Deck
+    h = HandState({1: 1000, 3: 1000, 5: 1000}, 2, 50, 100, Deck(12),
+                  blind_seats=(3, 5), forced_posts={1: (100, 50)})
+    play(h, "x", "c", "x")
+    while not h.is_over:
+        h.apply(Action.check())
+    assert [(p.amount, p.eligible) for p in h.result().pots] == [(350, (1, 3, 5))]
+
+def test_engine_accepts_missing_small_blind_and_rejects_invalid_forced_posts():
+    from backend.engine.cards import Deck
+
+    h = HandState({1: 1000, 3: 1000, 5: 1000}, 2, 50, 100, Deck(13),
+                  blind_seats=(None, 5))
+    assert h.sb_seat is None and h.bb_seat == 5
+    assert h.street_bet(3) == 0 and h.street_bet(5) == 100
+    assert h.to_act == 1
+    for posts in ({1: (0, 0)}, {1: (True, 1)}, {1: (101, 0)}, {5: (0, 1)}):
+        with pytest.raises(ValueError):
+            HandState({1: 1000, 3: 1000, 5: 1000}, 2, 50, 100, Deck(13),
+                      blind_seats=(None, 5), forced_posts=posts)
+
+def test_dead_posts_are_added_to_the_main_pot_before_side_pots_are_split():
+    from backend.engine.cards import Deck
+
+    h = HandState({0: 1000, 1: 100, 2: 1000}, 2, 100, 100, Deck(14),
+                  blind_seats=(0, 2), forced_posts={1: (50, 50)})
+    while not h.is_over:
+        legal = h.legal_actions()
+        h.apply(Action.check() if legal.can_check else Action.call())
+    assert [(pot.amount, pot.eligible) for pot in h.result().pots] == [
+        (200, (0, 1, 2)), (100, (0, 2))
+    ]
+
+def test_dead_only_all_in_is_eligible_for_dead_pool_at_showdown():
+    from backend.engine.cards import Deck, parse_cards
+
+    holes = {0: parse_cards("AsAd"), 1: parse_cards("KsKd"), 2: parse_cards("6cQd")}
+    board = parse_cards("2c3d4h5s9c")
+    order = [1, 2, 0]
+    top = [holes[s][0] for s in order] + [holes[s][1] for s in order]
+    used = set(board) | {c for cards in holes.values() for c in cards}
+    filler = iter(c for c in range(52) if c not in used)
+    top += [next(filler), *board[:3], next(filler), board[3], next(filler), board[4]]
+    deck = Deck(1)
+    deck._cards = top + [c for c in range(52) if c not in set(top)]
+
+    h = HandState({0: 1, 1: 1, 2: 50}, 0, 1, 1, deck,
+                  blind_seats=(0, 1), forced_posts={2: (0, 50)})
+    assert h.is_over
+    assert [(pot.amount, pot.eligible) for pot in h.result().pots] == [
+        (50, (0, 1, 2)), (2, (0, 1))
+    ]
+    assert h.result().pots[0].winners == (2,)
+    assert dict(h.result().payouts) == {0: 2, 1: 0, 2: 50}

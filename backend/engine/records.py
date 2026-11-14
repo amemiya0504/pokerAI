@@ -49,6 +49,10 @@ def hand_record(
         "button": state.button,
         "small_blind": state.small_blind,
         "big_blind": state.big_blind,
+        "sb_seat": state.sb_seat,
+        "bb_seat": state.bb_seat,
+        "forced_posts": {str(s): list(amounts) for s, amounts in state.forced_posts.items()},
+        "ante": state.ante,
         "players": [
             {
                 "seat": s,
@@ -90,6 +94,9 @@ def replay(record: Mapping[str, Any]) -> HandState:
         record["small_blind"],
         record["big_blind"],
         Deck(record["deck_seed"]),
+        ante=record.get("ante", 0),
+        blind_seats=(record["sb_seat"], record["bb_seat"]) if "sb_seat" in record else None,
+        forced_posts={int(s): tuple(amounts) for s, amounts in record.get("forced_posts", {}).items()},
     )
     for a in record["actions"]:
         if state.to_act != a["seat"]:

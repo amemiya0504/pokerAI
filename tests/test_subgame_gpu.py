@@ -151,3 +151,19 @@ def test_checkdown_tree_has_no_later_betting():
     assert ("chance", 1) not in seen and all(batch == 1 for _, batch in seen)  # no turn/river subtrees
     cfr.iterate(200)
     assert cfr.exploitability()["exploitability_pct_pot"] < 0.5
+
+
+def test_turn_equity_matrices_from_one_flop_pass_equal_per_board_matrices():
+    """``BatchedEquityMatrix`` scores the flop's runouts once and gives each
+    turn its rows; that must equal building each turn's matrix on its own."""
+    import numpy as np
+
+    from backend.solver import subgame_gpu as g
+
+    flop = tuple(parse_cards("Qs8d3h"))
+    turns = [c for c in (0, 17, 34, 51) if c not in flop]
+    g._EQUITY_CACHE = None  # force the shared-flop path
+    batched = g.BatchedEquityMatrix(np.array([flop + (c,) for c in turns]), "cpu", torch.float64)
+    for i, c in enumerate(turns):
+        own = g.EquityMatrix(flop + (c,), "cpu", torch.float64).W
+        assert torch.equal(batched.W[i], own)

@@ -1,6 +1,8 @@
 """FastAPI app: REST for games and history, a websocket per live game.
 
-    uvicorn --factory backend.api.app:create_app   # uses POKER_DB_URL, POKER_AI_DELAY
+    uvicorn --factory backend.api.app:create_app   # uses POKER_DB_URL, POKER_AI_DELAY, POKER_AI_DIR
+
+The AI decision API (`/api/ai`, `backend.api.ai`) keeps its sessions as JSON files in POKER_AI_DIR.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ import asyncio
 import os
 import random
 import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
@@ -23,6 +26,7 @@ from backend.db.repository import create_game, players_by_id, replay_hand
 from backend.engine.cards import Deck, cards_str
 from backend.engine.hand import HandState
 
+from .ai import make_router
 from .sessions import GameSession
 from .views import view_json
 
@@ -46,7 +50,7 @@ class CreateGame(BaseModel):
 
 
 def create_app(db_url: str | None = None, *, ai_delay: float | None = None,
-               static_dir: Path | None = FRONTEND_DIST) -> FastAPI:
+               static_dir: Path | None = FRONTEND_DIST, ai_dir: Path | str | None = None) -> FastAPI:
     db_url = db_url or os.environ.get("POKER_DB_URL", "sqlite:///poker.db")
     if ai_delay is None:
         ai_delay = float(os.environ.get("POKER_AI_DELAY", "0.6"))
@@ -55,6 +59,16 @@ def create_app(db_url: str | None = None, *, ai_delay: float | None = None,
     live: dict[int, GameSession] = {}
 
     app = FastAPI(title="Poker AI")
+    app.include_router(make_router(ai_dir))
+
+    @app.middleware("http")
+    async def expose_ai_request_duration(request, call_next):
+        if not request.url.path.startswith("/api/ai/"):
+            return await call_next(request)
+        started = time.perf_counter_ns()
+        response = await call_next(request)
+        response.headers["X-QQPK-Server-Ms"] = f"{(time.perf_counter_ns() - started) / 1_000_000:.3f}"
+        return response
 
     live_lock = threading.Lock()  # sync routes run in a threadpool
 
@@ -127,11 +141,19 @@ def create_app(db_url: str | None = None, *, ai_delay: float | None = None,
         seat = session.human_seat if session.human_seat in final.seats else None
         state = HandState({p["seat"]: p["start_stack"] for p in hand.start_stacks},
                           hand.button_seat, hand.small_blind, hand.big_blind, Deck(hand.deck_seed))
-        steps = [{"action": None, "view": view_json(state.observation(seat))}]
+        def replay_view() -> dict[str, Any]:
+            revealed_cards = ({
+                s: state.hole_cards(s)
+                for s in state.seats
+                if s != seat
+            } if state.is_over else None)
+            return view_json(state.observation(seat), revealed_cards=revealed_cards)
+
+        steps = [{"action": None, "view": replay_view()}]
         for s, action in final.actions:
             state.apply(action)
             steps.append({"action": {"seat": s, "type": str(action.type), "amount": action.amount},
-                          "view": view_json(state.observation(seat))})
+                          "view": replay_view()})
         return {
             "hand_id": hand.id,
             "game_id": hand.game_id,
