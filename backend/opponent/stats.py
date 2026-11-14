@@ -77,12 +77,30 @@ def group_street(group: str) -> str:
 _EARLY = ("UTG", "UTG1", "UTG2", "LJ", "HJ", "CO")
 
 
-def positions(seats: Iterable[int], button: int) -> dict[int, str]:
+def positions(seats: Iterable[int], button: int, sb_seat: int | None = None,
+              bb_seat: int | None = None) -> dict[int, str]:
     """Position names for the seats dealt in. Heads-up: BTN (small blind) and BB."""
     order = sorted(seats)
+    n = len(order)
+    if bb_seat is not None and sb_seat is None:
+        clockwise = order[order.index(bb_seat) + 1:] + order[:order.index(bb_seat) + 1]
+        before_button = clockwise[:clockwise.index(button)] if button in order else clockwise[:-1]
+        early = list(_EARLY[:len(before_button)])
+        early.extend(f"UTG+{i}" for i in range(len(early) + 1, len(before_button) + 1))
+        names = early + (["BTN"] if button in order else []) + ["BB"]
+        return dict(zip(before_button + ([button] if button in order else []) + [bb_seat], names))
+    if sb_seat is not None and bb_seat is not None:
+        if n == 2 and button == sb_seat:
+            return {sb_seat: "BTN", bb_seat: "BB"}
+        clockwise = order[order.index(bb_seat) + 1:] + order[:order.index(bb_seat) + 1]
+        before_sb = clockwise[:clockwise.index(sb_seat)]
+        has_button = button in before_sb
+        early_count = len(before_sb) - int(has_button)
+        early = _EARLY[:early_count] if not has_button else _EARLY[len(_EARLY) - early_count:] if early_count else ()
+        names = list(early) + (["BTN"] if has_button else []) + ["SB", "BB"]
+        return dict(zip(before_sb + [sb_seat, bb_seat], names))
     i = order.index(button)
     clockwise = order[i:] + order[:i]  # button first
-    n = len(order)
     if n == 2:
         return {clockwise[0]: "BTN", clockwise[1]: "BB"}
     names = ["BTN", "SB", "BB"] + list(_EARLY[len(_EARLY) - (n - 3):] if n > 3 else ())
@@ -148,11 +166,15 @@ class PublicHand:
     actions: tuple[tuple[int, Action], ...]  # (seat, action) in order
     showdown: frozenset[int]  # seats that reached showdown
     won_at_showdown: frozenset[int]  # seats awarded chips at showdown
+    ante: int = 0
+    sb_seat: int | None = None
+    bb_seat: int | None = None
+    forced_posts: Mapping[int, tuple[int, int]] | None = None
 
     @classmethod
-    def from_view(cls, view: PlayerView) -> PublicHand:
-        """From the final observation of any seat (or a spectator)."""
-        if not view.is_over:
+    def from_view(cls, view: PlayerView, partial: bool = False) -> PublicHand:
+        """From the final observation of any seat (or a spectator); ``partial`` accepts a hand still in progress."""
+        if not (view.is_over or partial):
             raise ValueError("the hand is not over")
         contributed = {s.seat: 0 for s in view.seats}
         awarded = {s.seat: 0 for s in view.seats}
@@ -166,6 +188,13 @@ class PublicHand:
             elif e.type is EventType.POST_BLIND:
                 contributed[e.seat] += e.amount
                 street_bet[e.seat] += e.amount
+            elif e.type is EventType.POST_ANTE:
+                contributed[e.seat] += e.amount
+            elif e.type is EventType.POST_LIVE:
+                contributed[e.seat] += e.amount
+                street_bet[e.seat] += e.amount
+            elif e.type is EventType.POST_DEAD:
+                contributed[e.seat] += e.amount
             elif e.type is EventType.RETURN_UNCALLED:
                 contributed[e.seat] -= e.amount
                 street_bet[e.seat] -= e.amount
@@ -188,8 +217,15 @@ class PublicHand:
                 if showdown and e.amount > 0:
                     won.add(e.seat)
         start = {s.seat: s.stack - awarded[s.seat] + contributed[s.seat] for s in view.seats}
+        sb_seat, bb_seat = view.sb_seat, view.bb_seat
+        if bb_seat is None and view.button in contributed:
+            order = sorted(contributed)
+            clockwise = order[order.index(view.button) + 1:] + order[:order.index(view.button)]
+            sb_seat, bb_seat = ((view.button, clockwise[0]) if len(order) == 2
+                                else (clockwise[0], clockwise[1]))
         return cls(view.button, view.small_blind, view.big_blind, start, tuple(actions),
-                   frozenset(showdown), frozenset(won))
+                   frozenset(showdown), frozenset(won), view.ante, sb_seat, bb_seat,
+                   dict(view.forced_posts or {}))
 
     @classmethod
     def from_state(cls, state: HandState) -> PublicHand:
@@ -211,10 +247,13 @@ class Observation:
     position: str
 
 
-def observations(hand: PublicHand) -> list[Observation]:
-    """Every statistic's opportunities in one hand, with their outcome."""
-    state = HandState(dict(hand.start_stacks), hand.button, hand.small_blind, hand.big_blind, Deck(0))
-    pos = positions(hand.start_stacks, hand.button)
+def observations(hand: PublicHand, partial: bool = False) -> list[Observation]:
+    """Every statistic's opportunities in one hand, with their outcome; ``partial``: only those played so far."""
+    state = HandState(dict(hand.start_stacks), hand.button, hand.small_blind, hand.big_blind,
+                      Deck(0), ante=hand.ante,
+                      blind_seats=(hand.sb_seat, hand.bb_seat) if hand.bb_seat is not None else None,
+                      forced_posts=hand.forced_posts or {})
+    pos = positions(hand.start_stacks, hand.button, hand.sb_seat, hand.bb_seat)
     out: list[Observation] = []
 
     def add(seat: int, group: str, outcome: str) -> None:
@@ -269,7 +308,7 @@ def observations(hand: PublicHand) -> list[Observation]:
             if raises == 0 and seat != pf_aggressor and action.type is ActionType.BET:
                 cbet_chance_done = True  # someone led into the aggressor: no c-bet chance
         state.apply(action)
-    if not state.is_over:
+    if not (state.is_over or partial):
         raise ValueError("the hand did not finish")
     flop_seen = set(hand.start_stacks) - pf_folded if len(state.board) >= 3 else set()
     for seat in sorted(pf_decided):

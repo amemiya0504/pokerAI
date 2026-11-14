@@ -16,7 +16,7 @@ from pathlib import Path
 
 from backend.agents import CallingStationAgent, RuleBasedAgent
 from backend.agents.web_preflop import POSITIONS, TABLE_PATH, context as preflop_context, position
-from backend.agents.web_realtime import WebRealtimeAgent
+from backend.agents.web_realtime import STYLE_KEY, WebRealtimeAgent, observe_opening
 from backend.engine.actions import ActionType
 from backend.engine.cards import Deck, derive_seed
 from backend.engine.hand import HandState, Street
@@ -57,9 +57,12 @@ def context_rates(counts):
 BB_CHIPS = 100
 
 def simulate(n, opponent, deals, seed, mode, seconds, log=print, capture_samples=False, multiway_bluff=False, deal_start=0,
-             stack_bb=100, persistent_models=False, adaptive=False, station_ranges=False):
+             stack_bb=100, persistent_models=False, adaptive=False, station_ranges=False, ante_bb=0,
+             observe_first_decision=False, table_heads_up=False):
     """``persistent_models``: hero keeps one opponent-model dict for the whole run (every opponent seat
-    holds the same opponent type), as a web session does; by default each hand starts with none."""
+    holds the same opponent type), as a web session does; by default each hand starts with none.
+    ``observe_first_decision``: learn only what the hero saw before its first preflop decision, as the
+    snapshot API does, instead of the whole finished hand."""
     if deal_start < 0:
         raise ValueError("deal_start must be nonnegative")
     shared_models = {} if persistent_models else None
@@ -78,19 +81,25 @@ def simulate(n, opponent, deals, seed, mode, seconds, log=print, capture_samples
         deal_positions = {pos: 0.0 for pos in POSITIONS[n]}
         for hero in range(n):
             h = HandState({s: round(stack_bb * BB_CHIPS) for s in range(n)}, 0, BB_CHIPS // 2, BB_CHIPS,
-                          Deck(derive_seed(seed, n, deal)))
+                          Deck(derive_seed(seed, n, deal)), ante=round(ante_bb * BB_CHIPS))
             hero_position = position(h.observation(hero))
             agent = WebRealtimeAgent(derive_seed(seed, n, deal, hero), mode=mode, seconds=seconds, multiway_bluff=multiway_bluff,
-                                     opponent_models=shared_models, adaptive=adaptive, station_ranges=station_ranges)
+                                     opponent_models=shared_models, adaptive=adaptive, station_ranges=station_ranges,
+                                     table_heads_up=table_heads_up)
             others = {s: OPPONENTS[opponent](derive_seed(seed, n, deal, hero, s)) for s in range(n) if s != hero}
             stats = by_position[position(h.observation(hero))]
             stats["hands"] += 1
             voluntary, raised = False, False
             bluff_selected = False
             raises = 0
+            opening_seen = False
             while not h.is_over:
                 seat, legal = h.to_act, h.legal_actions()
                 view = h.observation(seat)
+                if observe_first_decision and seat == hero and not opening_seen:
+                    opening_seen = True
+                    observe_opening(shared_models, shared_models.setdefault(STYLE_KEY, {}), view,
+                                    {s: s for s in range(n)})
                 started = time.perf_counter()
                 d = (agent if seat == hero else others[seat]).act(view, legal)
                 if seat == hero and view.street is not Street.PREFLOP:
@@ -146,7 +155,8 @@ def simulate(n, opponent, deals, seed, mode, seconds, log=print, capture_samples
                 bluff_hand_net.append(hand_net)
             net += hand_net
             deal_positions[hero_position] = hand_net
-            agent.hand_over(h.observation(hero))
+            if not observe_first_decision:
+                agent.hand_over(h.observation(hero))
         profits.append(net / n)
         if capture_samples:
             samples["profit"].append(net / n)

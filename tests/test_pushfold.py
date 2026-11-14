@@ -51,6 +51,37 @@ def test_tree_size_and_zero_sum_payoffs(n):
         assert sum(tr.payoff(t, f, mask, scores) for t in range(n)) == pytest.approx(0)
 
 
+@pytest.mark.parametrize("n", [2, 3, 6])
+def test_antes_stay_zero_sum_and_are_dead_money(n):
+    game = PushFoldGame(n, 10, 0.5)
+    tr = _Traverser(game)
+    rng = random.Random(n)
+    for _ in range(200):
+        scores = [rng.randint(0, 5) for _ in range(n)]
+        f = rng.randint(-1, n - 2)
+        mask = 0 if f < 0 else sum(1 << i for i in range(f + 1, n) if rng.random() < 0.5)
+        assert sum(tr.payoff(t, f, mask, scores) for t in range(n)) == pytest.approx(0)
+    assert tr.payoff(n - 1, -1, 0, [0] * n) == pytest.approx(0.5 + 0.5 * (n - 1))  # BB wins SB + other antes
+    # uncalled push by the first seat: the other players' blinds and antes (heads-up it is the SB itself)
+    assert tr.payoff(0, 0, 0, [0] * n) == pytest.approx((1.0 if n == 2 else 1.5) + 0.5 * (n - 1))
+
+
+def test_ante_cannot_exceed_the_stack():
+    with pytest.raises(ValueError):
+        PushFoldGame(2, 1.4, 0.5)
+
+
+def test_solver_opens_wider_with_antes():
+    from backend.solver.pushfold import PushFoldSolver, request
+
+    def pushed(ante):
+        res = PushFoldSolver(1).solve(request(2, 10, ante=ante, batches=20, deals_per_batch=2000,
+                                              eval_deals=2000, seed=5))
+        return sum(res.strategy["SB|open"]["aggress_prob"])
+
+    assert pushed(0.5) > pushed(0)
+
+
 @pytest.fixture(scope="module")
 def hu_matrix():
     return hu_equity_matrix(samples=150, seed=3)

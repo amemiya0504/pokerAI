@@ -294,6 +294,27 @@ def test_multiway_equity_uses_public_action_conditioned_ranges():
     assert equity(view, samples=12) == pytest.approx(equity(view, samples=12))
 
 
+@pytest.mark.parametrize(("street", "power"), [(Street.RIVER, 2), (Street.FLOP, 1)])
+def test_a_river_raise_over_a_bet_narrows_twice_as_hard_as_a_bet(street, power):
+    from backend.agents.realtime import heuristic_likelihood, strength_percentile
+    from backend.agents.web_realtime import _public_ranges
+    from backend.engine.actions import ActionType
+
+    h = hand(3)
+    while h.street is not street:
+        legal = h.legal_actions()
+        h.apply(Action.check() if legal.can_check else Action.call())
+    bettor = h.to_act
+    h.apply(Action.bet(100))
+    raiser = h.to_act
+    watcher = next(s for s in (0, 2, 4) if s not in (bettor, raiser))
+    before = _public_ranges(h.observation(watcher))
+    h.apply(Action.raise_to(300))
+    after = _public_ranges(h.observation(watcher))
+    bet = heuristic_likelihood(ActionType.BET, strength_percentile(tuple(h.observation(watcher).board)))
+    assert np.allclose(after[raiser], before[raiser] * bet ** power)
+
+
 
 @pytest.mark.parametrize(("equity_delta", "expected_fold", "expected_call"), [
     (-.01, 1.0, 0.0),

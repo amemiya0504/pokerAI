@@ -20,13 +20,13 @@ Rule decisions (see the design doc, section 7.2):
 * With at most one player able to act and bets matched, the rest of the
   board is dealt automatically.
 * Everyone who reaches showdown shows their cards.
-* Antes are not supported yet (the parameter is reserved).
+* Antes are posted to total contribution before the blinds and do not count toward the preflop street bet.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 
 from .actions import Action, ActionType, IllegalActionError, LegalActions
@@ -47,7 +47,10 @@ class Street(IntEnum):
 
 
 class EventType(StrEnum):
+    POST_ANTE = "post_ante"
     POST_BLIND = "post_blind"
+    POST_LIVE = "post_live"
+    POST_DEAD = "post_dead"
     ACTION = "action"
     DEAL_BOARD = "deal_board"
     RETURN_UNCALLED = "return_uncalled"
@@ -96,6 +99,10 @@ class PlayerView:
     seats: tuple[SeatView, ...]
     history: tuple[Event, ...]
     is_over: bool
+    ante: int = 0
+    sb_seat: int | None = None
+    bb_seat: int | None = None
+    forced_posts: Mapping[int, tuple[int, int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -154,15 +161,38 @@ class HandState:
         deck: Deck,
         *,
         ante: int = 0,
+        blind_seats: tuple[int | None, int] | None = None,
+        forced_posts: Mapping[int, tuple[int, int]] | None = None,
     ) -> None:
-        if ante:
-            raise NotImplementedError("antes are not supported in Milestone 1")
         if not 2 <= len(stacks) <= MAX_PLAYERS:
             raise ValueError("a hand needs 2 to 9 players")
         if not 0 < small_blind <= big_blind:
             raise ValueError("blinds must satisfy 0 < small_blind <= big_blind")
-        if button not in stacks:
-            raise ValueError("button must be a seat in the hand")
+        if ante < 0:
+            raise ValueError("ante must be non-negative")
+        if type(button) is not int or not 0 <= button < MAX_PLAYERS:
+            raise ValueError("invalid button seat")
+        if blind_seats is None:
+            if button not in stacks:
+                raise ValueError("button must be a seat in the hand unless blind seats are explicit")
+        elif (len(blind_seats) != 2
+              or (blind_seats[0] is not None and
+                  (type(blind_seats[0]) is not int or blind_seats[0] not in stacks))
+              or type(blind_seats[1]) is not int or blind_seats[1] not in stacks
+              or blind_seats[0] == blind_seats[1]):
+            raise ValueError("blind seats must be distinct hand seats; small blind may be absent")
+        forced_posts = dict(forced_posts or {})
+        for seat, posts in forced_posts.items():
+            if (type(seat) is not int or seat not in stacks or type(posts) is not tuple
+                    or len(posts) != 2 or any(type(n) is not int or n < 0 for n in posts)):
+                raise ValueError("forced posts must map hand seats to non-negative (live, dead) integer amounts")
+            live, dead = posts
+            if live + dead == 0:
+                raise ValueError("forced post total must be positive")
+            if live > big_blind:
+                raise ValueError("live forced post must not exceed one big blind")
+            if blind_seats is not None and seat in blind_seats:
+                raise ValueError("a blind seat cannot also make an extra forced post")
         for seat, stack in stacks.items():
             if not 0 <= seat < MAX_PLAYERS:
                 raise ValueError(f"invalid seat {seat}")
@@ -171,11 +201,14 @@ class HandState:
 
         self.small_blind = small_blind
         self.big_blind = big_blind
+        self.ante = ante
         self.button = button
+        self.forced_posts = forced_posts
         self.deck_seed = deck.seed
         self._deck = deck
         self._order = sorted(stacks)
         self._players = {s: _Player(s, stacks[s]) for s in self._order}
+        self._dead_contribution = {s: 0 for s in self._order}
         self.board: list[int] = []
         self.street = Street.PREFLOP
         self.current_bet = 0
@@ -186,12 +219,16 @@ class HandState:
         self.actions: list[tuple[int, Action]] = []
         self._result: HandResult | None = None
 
-        if len(self._order) == 2:
+        if blind_seats is not None:
+            self.sb_seat, self.bb_seat = blind_seats
+        elif len(self._order) == 2:
             self.sb_seat = button
             self.bb_seat = self._next_seat(button)
         else:
             self.sb_seat = self._next_seat(button)
             self.bb_seat = self._next_seat(self.sb_seat)
+        if self.sb_seat in self.forced_posts or self.bb_seat in self.forced_posts:
+            raise ValueError("a blind seat cannot also make an extra forced post")
 
         first = self._next_seat(button)
         dealt: dict[int, list[int]] = {s: [] for s in self._order}
@@ -201,9 +238,18 @@ class HandState:
         for seat, cards in dealt.items():
             self._players[seat].hole = tuple(cards)
 
-        self._post_blind(self.sb_seat, small_blind)
+        if ante:
+            for seat in self._order:
+                self._post_ante(seat, ante)
+        if self.sb_seat is not None:
+            self._post_blind(self.sb_seat, small_blind)
         self._post_blind(self.bb_seat, big_blind)
-        self.current_bet = big_blind
+        for seat, (live, dead) in self.forced_posts.items():
+            if live:
+                self._post_live(seat, live)
+            if dead:
+                self._post_dead(seat, dead)
+        self.current_bet = max(big_blind, *(p.street_bet for p in self._players.values()))
         self._start_round(self._next_seat(self.bb_seat))
 
     # ------------------------------------------------------------------ queries
@@ -310,6 +356,10 @@ class HandState:
             seats=seat_views,
             history=tuple(self.events),
             is_over=self.is_over,
+            ante=self.ante,
+            sb_seat=self.sb_seat,
+            bb_seat=self.bb_seat,
+            forced_posts=dict(self.forced_posts),
         )
 
     def result(self) -> HandResult:
@@ -360,12 +410,11 @@ class HandState:
     # ----------------------------------------------------------------- internals
 
     def _next_seat(self, seat: int) -> int:
-        i = self._order.index(seat)
-        return self._order[(i + 1) % len(self._order)]
+        return next(s for offset in range(1, MAX_PLAYERS + 1)
+                    if (s := (seat + offset) % MAX_PLAYERS) in self._players)
 
     def _seats_from(self, seat: int) -> list[int]:
-        i = self._order.index(seat)
-        return self._order[i:] + self._order[:i]
+        return sorted(self._order, key=lambda s: (s - seat) % MAX_PLAYERS)
 
     def _emit(self, type: EventType, seat: int | None = None, **kw) -> None:
         self.events.append(Event(type, self.street, seat, **kw))
@@ -381,6 +430,27 @@ class HandState:
         chips = min(blind, p.stack)
         self._commit(p, chips)
         self._emit(EventType.POST_BLIND, seat, amount=chips)
+
+    def _post_live(self, seat: int, amount: int) -> None:
+        p = self._players[seat]
+        chips = min(amount, p.stack)
+        self._commit(p, chips)
+        self._emit(EventType.POST_LIVE, seat, amount=chips)
+
+    def _post_dead(self, seat: int, amount: int) -> None:
+        p = self._players[seat]
+        chips = min(amount, p.stack)
+        p.stack -= chips
+        p.total_bet += chips
+        self._dead_contribution[seat] += chips
+        self._emit(EventType.POST_DEAD, seat, amount=chips)
+
+    def _post_ante(self, seat: int, ante: int) -> None:
+        p = self._players[seat]
+        chips = min(ante, p.stack)
+        p.stack -= chips
+        p.total_bet += chips
+        self._emit(EventType.POST_ANTE, seat, amount=chips)
 
     def _needs_action(self, p: _Player) -> bool:
         if not p.can_act:
@@ -442,12 +512,19 @@ class HandState:
     def _pots(self) -> list[tuple[int, tuple[int, ...]]]:
         players = list(self._players.values())
         live = [q for q in players if q.live]
+        live_contribution = {
+            q.seat: q.total_bet - self._dead_contribution[q.seat] for q in players
+        }
+        dead_total = sum(self._dead_contribution.values())
         pots: list[tuple[int, tuple[int, ...]]] = []
+        if dead_total:
+            pots.append((dead_total, tuple(q.seat for q in live)))
         prev = 0
-        for level in sorted({q.total_bet for q in live}):
-            amount = sum(min(q.total_bet, level) - min(q.total_bet, prev) for q in players)
+        for level in sorted(live_contribution[q.seat] for q in live):
+            amount = sum(max(min(live_contribution[q.seat], level)
+                             - min(live_contribution[q.seat], prev), 0) for q in players)
             eligible = tuple(s for s in self._order
-                             if self._players[s].live and self._players[s].total_bet >= level)
+                             if self._players[s].live and live_contribution[s] >= level)
             prev = level
             if amount == 0:
                 continue
@@ -455,10 +532,6 @@ class HandState:
                 pots[-1] = (pots[-1][0] + amount, eligible)
             else:
                 pots.append((amount, eligible))
-        leftover = sum(max(q.total_bet - prev, 0) for q in players)
-        if leftover:
-            amount, eligible = pots[-1]
-            pots[-1] = (amount + leftover, eligible)
         return pots
 
     def _finish(self, showdown: bool) -> None:

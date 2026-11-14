@@ -11,6 +11,10 @@ hand's percentile within that capped range and continue with the best MDF-scaled
 v8.3 tables (``priced_raises``) store, in every vs 3-bet / cold 3-bet / vs 4-bet / vs 5-bet node, each
 hand's equity vs an assumed raiser range. A hand then also continues (by calling) when that equity,
 discounted for realisation, covers the actual price, so a cheap raise is not folded to like a large one.
+
+v8.4 tables (``small_3bet_oop`` / ``realization``) widen the vs 3-bet nodes, count a 3-bet from a player
+out of position against the opener as "small" up to a larger multiple (the usual blind 3-bet is 4–4.5x),
+and use a separate realisation share in and out of position for the priced calls.
 """
 
 from __future__ import annotations
@@ -58,9 +62,28 @@ def depth_bucket(bb: float) -> int:
     return DEPTHS[-1]
 
 
+def postflop_rank(n: int, pos: str) -> int:
+    """Postflop acting order (0 acts first): SB, BB, then the preflop order; heads-up the button acts last."""
+    positions = POSITIONS[n]
+    if pos not in positions:
+        positions = (*POSITIONS[9][:n - 2], "SB", "BB")
+    if n == 2:
+        return 1 if pos == positions[0] else 0
+    return {"SB": 0, "BB": 1}.get(pos, 2 + positions.index(pos))
+
+
+def in_position(view: PlayerView) -> bool:
+    """True when every other live player acts before this one postflop."""
+    n, me = len(view.seats), postflop_rank(len(view.seats), position(view))
+    return all(postflop_rank(n, position(view, s.seat)) < me
+               for s in view.seats if not s.folded and s.seat != view.seat)
+
+
 def side(n: int, pos: str) -> str:
     """Early = seats before CO; tables without a CO (2–4 handed) have no early seats."""
     positions = POSITIONS[n]
+    if pos not in positions:
+        positions = (*POSITIONS[9][:n - 2], "SB", "BB")
     return "early" if "CO" in positions and positions.index(pos) < positions.index("CO") else "late"
 
 
@@ -99,7 +122,9 @@ def _a3_group(view: PlayerView, group: str) -> str:
     return group
 
 
-def context(view: PlayerView, legal: LegalActions, defend: bool = False) -> str:
+def context(view: PlayerView, legal: LegalActions, defend: bool = False,
+            small_oop: float = SMALL_3BET_MULTIPLE) -> str:
+    """``small_oop``: largest "small" 3-bet multiple when the 3-bettor is out of position against the opener."""
     n = len(view.seats)
     actions = [e for e in view.history if e.type is EventType.ACTION and e.street is Street.PREFLOP]
     raises = [e for e in actions if e.action in (ActionType.BET, ActionType.RAISE)]
@@ -128,7 +153,9 @@ def context(view: PlayerView, legal: LegalActions, defend: bool = False) -> str:
     group, price = base.split(":")
     if len(raises) == 2:
         if mine == [0]:
-            size = "small" if raises[1].amount <= SMALL_3BET_MULTIPLE * raises[0].amount else "large"
+            oop = postflop_rank(n, position(view, raises[1].seat)) < postflop_rank(n, position(view))
+            small = small_oop if oop else SMALL_3BET_MULTIPLE
+            size = "small" if raises[1].amount <= small * raises[0].amount else "large"
             group = f"vs_3bet_{side(n, position(view, raises[1].seat))}_{size}"
         else:
             group = "cold_vs_3bet"
@@ -141,8 +168,10 @@ def context(view: PlayerView, legal: LegalActions, defend: bool = False) -> str:
     return f"{group}:{price}"
 
 
-def key(view: PlayerView, legal: LegalActions, defend: bool = False) -> str:
-    return f"{len(view.seats)}/{depth_bucket(effective_bb(view))}/{position(view)}/{context(view, legal, defend)}"
+def key(view: PlayerView, legal: LegalActions, defend: bool = False,
+        small_oop: float = SMALL_3BET_MULTIPLE) -> str:
+    return (f"{len(view.seats)}/{depth_bucket(effective_bb(view))}/{position(view)}/"
+            f"{context(view, legal, defend, small_oop)}")
 
 
 def call_probs(view: PlayerView, legal: LegalActions, equity, realization: float = 1.0) -> np.ndarray:
@@ -165,12 +194,12 @@ def allin_probs(view: PlayerView, legal: LegalActions, table: dict) -> np.ndarra
     return np.stack([1 - call, call, np.zeros_like(call)], axis=1)
 
 
-def priced_probs(view: PlayerView, legal: LegalActions, table: dict) -> np.ndarray:
+def priced_probs(view: PlayerView, legal: LegalActions, table: dict, realization: float = REALIZATION) -> np.ndarray:
     """v8.3 raise node: the table row, widened by calls whose realised equity covers the actual price."""
     probs = np.array(table["probs"], dtype=float)
     if not legal.can_call:
         return probs
-    cont = np.maximum(1 - probs[:, 0], call_probs(view, legal, table["equity"], REALIZATION))
+    cont = np.maximum(1 - probs[:, 0], call_probs(view, legal, table["equity"], realization))
     raising = np.minimum(probs[:, 2], cont)
     return np.stack([1 - cont, cont - raising, raising], axis=1)
 
@@ -214,17 +243,24 @@ def validate(data: dict) -> None:
                 or not math.isfinite(table["raise_multiple"]) or table["raise_multiple"] <= 1
                 or not 0 < table["jam_fraction"] <= 1):
             raise ValueError(f"invalid sizing in {k}")
+    realization = data.get("realization", {"ip": REALIZATION, "oop": REALIZATION})
+    if set(realization) != {"ip", "oop"} or not all(0 < x <= 1 for x in realization.values()):
+        raise ValueError("invalid realization shares")
+    if not SMALL_3BET_MULTIPLE <= data.get("small_3bet_oop", SMALL_3BET_MULTIPLE) <= 10:
+        raise ValueError("invalid small 3-bet multiple")
 
 
 def lookup(view: PlayerView, legal: LegalActions, data: dict, defend: bool = False) -> tuple[np.ndarray, dict, str]:
-    k = key(view, legal, defend and "defend_groups" in data)
+    k = key(view, legal, defend and "defend_groups" in data, data.get("small_3bet_oop", SMALL_3BET_MULTIPLE))
     table = data["tables"][k]
     if k.endswith(":allin"):
         probs = allin_probs(view, legal, table)
     elif k.endswith(":mdf"):
         probs = defend_probs(view, legal, table)
     elif "equity" in table:
-        probs = priced_probs(view, legal, table)
+        realization = data.get("realization")
+        probs = priced_probs(view, legal, table, realization["ip" if in_position(view) else "oop"]
+                             if realization else REALIZATION)
     else:
         probs = np.array(table["probs"], dtype=float)
     return probs, table, k

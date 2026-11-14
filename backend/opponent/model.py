@@ -204,11 +204,11 @@ class OpponentModel:
         c = by_pos.setdefault(obs.position, [0] * len(GROUPS[obs.group]))
         c[GROUPS[obs.group].index(obs.outcome)] += 1
 
-    def observe(self, hand: PublicHand, seat: int) -> None:
-        """Add one finished hand of the player sitting in ``seat``."""
+    def observe(self, hand: PublicHand, seat: int, partial: bool = False) -> None:
+        """Add one hand of the player sitting in ``seat`` (``partial``: a hand still in progress)."""
         if seat not in hand.start_stacks:
             raise ValueError(f"seat {seat} is not in this hand")
-        for o in observations(hand):
+        for o in observations(hand, partial):
             if o.seat == seat:
                 self.add(o)
         self.hands += 1

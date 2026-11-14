@@ -11,6 +11,7 @@ import asyncio
 import os
 import random
 import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
@@ -59,6 +60,15 @@ def create_app(db_url: str | None = None, *, ai_delay: float | None = None,
 
     app = FastAPI(title="Poker AI")
     app.include_router(make_router(ai_dir))
+
+    @app.middleware("http")
+    async def expose_ai_request_duration(request, call_next):
+        if not request.url.path.startswith("/api/ai/"):
+            return await call_next(request)
+        started = time.perf_counter_ns()
+        response = await call_next(request)
+        response.headers["X-QQPK-Server-Ms"] = f"{(time.perf_counter_ns() - started) / 1_000_000:.3f}"
+        return response
 
     live_lock = threading.Lock()  # sync routes run in a threadpool
 

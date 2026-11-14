@@ -272,6 +272,49 @@
   - 沒有 adaptive 的呼叫端（Arena、舊實驗）現在也讀 v8.3 的加注節點，所以不再與 v8.1 完全相同；對 station 仍相同（station 不加注）。
   - 固定 Arena 沒有重跑（理由見門檻第 5 點）。
 
+### 翻前 v8.4 面對 3bet 放寬（2026-10-28 驗收未通過；runtime 維持 v8.3）
+
+- 起因（使用者回報「面對 3bet 和 4bet 還是太緊」）。用 runtime 的 `lookup` 實際建牌局做靜態稽核（100 BB、其他人都棄牌，算繼續部分佔 open 範圍的比例）：
+  - v8.3 面對 3bet 大多只繼續 22–45%。例如 6-max BTN 被 BB 3bet 到 4 倍時只繼續 27%，2-max BTN 是 29%。
+  - BB 用任意兩張牌 3bet 到 10（4 倍）：多投 9 搶 4，棄牌率超過 69% 就賺錢，v8.3 棄 73%。
+  - 原因：繼續寬度是 `max(.055, open 寬度 × .24)`；超過 3.5 倍就算 large，再乘 0.8，所以盲注的標準 4–4.5 倍 3bet 落在最緊的那格；價格放寬用 0.70 的實現率，加上很窄的假設 3bet 範圍，所以只救得了最小 3bet。
+  - 面對 4bet（2.2–2.5 倍）會繼續自己 3bet 範圍的 54–90%，所以這次不改。
+- 改動（表 `backend/agents/data/web_preflop_v8_4.json.gz`，version `web-v8.4-wider-vs-3bet`，與 v8–v8.3 一起產生；舊四張重新產生後內容相同）：
+  1. vs 3bet 節點的繼續寬度 = open-raise 寬度 × `VS_3BET_SHARE`（3bettor 在後位 small .55／large .42，在前位 .50／.38），再乘原本的深度係數；取它與 v8.3 寬度的最大值（BB 的「open 寬度」不是 open 範圍，所以要保底）。4bet 寬度維持 v8.3，所以多出來的繼續全部是跟注。
+  2. 3bettor 在 open 者之後才行動（out of position，通常是盲注）時，4.5 倍以內都算 small（表欄位 `small_3bet_oop`）；in position 的 3bettor 維持 3.5 倍。
+  3. 價格放寬的實現率依位置設定：in position 0.85、out of position 0.70（表欄位 `realization`；判斷方式是翻後其他還沒棄牌的人是否都比自己先行動）。
+  - 沒有這兩個欄位的表（v8.3 以前）行為不變。範圍估計同樣走 `lookup`，所以會一起變。
+  - 靜態結果（100 BB，v8.3 → v8.4，繼續部分佔 open 範圍的比例）：6-max BTN 被 BB 3bet 到 4 倍 27% → 57%；CO 被 BTN 3bet 到 3 倍 40% → 58%；2-max BTN 被 BB 3bet 到 4 倍 29% → 55%；9-max UTG 被 CO 3bet 到 4 倍 43% → 48%。全部 480 個組合（3–5 倍）在 40／100／150 BB 介於 37–84%。
+  - 新剝削探針 `threebet`（`preflop_exploiters.py`）：第一次面對 open 且自己還沒行動時，用任意兩張牌 3bet 到 open 的 4 倍，每多一個跟注者再加 1 倍；其餘照 RuleBasedAgent。
+- **v8.4 驗收門檻（2026-10-28 01:40 CST，執行前訂定，不事後調整）**：
+  1. **100 BB**：`web_policy_ab.py --baseline backend/agents/data/web_preflop_v8_3.json.gz --candidate backend/agents/data/web_preflop_v8_4.json.gz --baseline-label v8.3 --candidate-label v8.4 --persistent-models --baseline-adaptive --candidate-adaptive --deals 3000 --seconds 2 --seed 20261114`，2–9-max × {station, rule, iso, squeeze, nit, tag, lag, maniac, minraise, threebet} 共 80 組：每組 v8.4−v8.3 的 95% CI 上界都 ≥ 0。
+  2. **40 BB 與 150 BB**：同上加 `--stack-bb {40,150}`，2–9-max × {rule, lag, threebet} 共 48 組：每組 95% CI 上界都 ≥ 0。
+  3. **threebet 必須顯著改善**：100 BB threebet 8 組合併（各組 bb/100 平均，SE = √(Σ 各組 SE²)/8），95% CI 下界 > 0。
+  4. 1–3 都通過，runtime 才改為 v8.4 表（`web_preflop.TABLE_PATH`，網頁 session 仍是 `adaptive=True`）；任一項不通過，runtime 維持 v8.3 並先分析，不調整門檻。
+  5. 不重跑固定 Arena：station 從不加注，所以 v8.4 對 station 與 v8.3 完全相同；對 rule 的影響由第 1、2 項配對檢查。這是限制，照實記錄。
+  - 種子 20261114 未用於設計：v8.4 的參數只看過靜態稽核，沒有看過任何模擬結果。冒煙測試（只確認流程）用種子 20261115、少量 deals，結果不採計。
+  - 128 組中即使兩版無差異，也可能有 1–3 組偽失敗；station 等不觸發 vs 3bet 節點的組會正好是 0。照實記錄，不改門檻。
+  - 執行：`out/web-realtime/v84_eval.py`（每組一個 process、隱藏 GPU、每個 process 1 個 BLAS thread、20 個 worker）。輸出 `out/web-realtime/v84-{opponent}-{stack}bb-{n}-3000.json`，manifest `v84-eval.manifest.json`（表與程式 SHA），進度 `v84-eval.out`，log `v84-logs/`，判定 `out/web-realtime/v84_gate.py`。
+- 冒煙（種子 20261115、每組 20 deals、結果不採計）：128 組全部 exit 0，判定腳本可讀全部報告。
+- **正式驗收已啟動（2026-10-28 01:55 CST）**：runner PID 259998（`setsid nohup`，不受 Claude 工作階段結束影響），20 個 worker。表 SHA-256 v8.4 `af07e262f685…`，全部見 manifest。
+  - 時間估計：9-max 對 station 單獨就要約 5.7 秒／deal（兩邊合計；多人翻後的 heuristic `equity` 占大半），所以單組約 5 小時；全部約 200 CPU 小時，預計 10–12 小時完成。
+  - 中斷後重跑同一行指令會跳過已完成的組（`web_policy_ab.py` 依 config 續跑），但同一組做到一半的進度會重來。
+  - 完成後執行 `.venv/bin/python out/web-realtime/v84_gate.py`，照門檻第 4 點決定是否切換 runtime。
+  - **2026-10-28 02:43 CST 依使用者要求暫停**：runner 259998 與 20 個 worker 都以 SIGSTOP 停住（狀態 T），記憶體中的進度保留。繼續：`kill -CONT 259998 $(pgrep -P 259998)`。若改為終止，已完成的組會保留，做到一半的組重跑時從頭開始。
+  - 2026-10-28 03:29 CST 依使用者要求以 SIGCONT 繼續。
+- **v8.4 驗收結果（2026-10-28 06:28 判定；123／128 組完成）：未通過**。單位 bb/100、95% CI；判定 `out/web-realtime/v84_gate.py`。
+  - 條件 1、2 **不通過**：10 組顯著為負，剩下 5 組（station 5–9-max）不論結果都改變不了判定。
+    - rule 100 BB：4-max −4.14 [−7.18,−1.11]、5-max −3.40；iso（rule＋iso 探針）4-max −4.14、5-max −3.41；squeeze 5-max −4.40 [−8.75,−0.05]。
+    - rule 40 BB：3-max −1.98 [−3.93,−0.03]、4-max −2.89 [−4.63,−1.14]；rule 150 BB：3-max −4.97 [−9.37,−0.58]、4-max −3.51 [−6.69,−0.32]。
+    - maniac 100 BB 8-max −0.12 [−0.23,−0.02]（只有 UTG −0.8 顯著）。
+    - 逐位置：損失集中在 BTN／SB（例如 rule 100 BB 4-max BTN −3.9、SB −7.4；5-max BTN −8.9；squeeze 5-max BTN −10.8，都顯著）。rule 的盲注只用強牌 3bet，v8.4 放寬的跟注正好對上它的價值範圍。
+    - station 2–4-max 正好是 0（station 不加注）。
+  - 條件 3 通過：threebet 100 BB 合併 +22.30 [+18.57,+26.03]；threebet 24 組（三種深度）全部顯著為正（+13.61 到 +41.85）。
+  - 其他：nit 5–8-max、tag 5–6-max 顯著為正；lag 40／150 BB 多組顯著為正，100 BB 全部不顯著；minraise 3–9-max 顯著為正。
+  - 解讀：放寬確實修好了「任意兩張牌 3bet 有利可圖」的漏洞，也讓對 tag／nit 更好；但對只用價值牌 3bet 的對手變差。v8.4 這種固定寬度沒辦法同時兼顧兩者。
+- **runtime 維持 v8.3**（照門檻第 4 點）；`web_preflop.TABLE_PATH`、`test_v83_with_a83_is_the_runtime` 都沒改。v8.4 表、探針與測試保留在程式中（沒有 `small_3bet_oop`／`realization` 欄位的表行為不變）。`tests/test_web_preflop_v8.py` 63 passed、`test_web_realtime.py`＋`test_api.py`＋`test_api_ai.py` 82 passed。
+- 可能的下一步（未做，需新門檻與新種子）：比照 A8.3，只對被觀察到 3bet 頻率高的對手（同一 session、足夠樣本）才用 v8.4 的 vs 3bet 節點，其他情況維持 v8.3。
+
 ## 暫停檢查點（2026-10-24 19:43 CST；歷史紀錄）
 
 - 使用者要把計算移到另一台電腦；目前評估程序已按 PID 停止。SIGINT 一度被背景程序忽略，之後對各工作 PID 發 SIGTERM。已確認沒有 web_policy_ab.py、web_realtime_accept.py、Arena runner、網路評估、網站 supervisor 或 vite/uvicorn 程序仍在跑。
@@ -430,3 +473,162 @@ E2 用的 GTO 對手模型 `gto-opponent.json` 要用 seed 10，不能和參考�
 - **`pgrep -f`／`pkill -f` 會殺到自己**：同一個指令裡含有要比對的字串時會 exit 144（這次又踩到一次，連佇列一起殺掉）。用 PID，或用輸出檔判斷狀態。
 - **資料（不在 git 裡，可重建）**：`out/datasets/gto-postflop-hu-v1`、`-v2`；`out/policy/v1v2-features.npz`；各模型 `out/policy/*/model.pt`；M8／M9 報告在 `out/opponent/`、`out/m9/`。
 - **git push**：從 Claude 的工作階段推送會卡在 Windows 的 Git Credential Manager；請使用者自己執行 `cd ~/poker && git push`。
+
+### 快照 API 實戰調整（2026-11-08）
+
+`POST /api/ai/sessions/{sid}/snapshot-decide` 現況（向下相容：`view.history` 為空時行為同前，只有 `label` 改為依實際來源顯示）：
+
+- **輸入**：`view.history` 可傳完整事件（codec 六欄，含 post_ante／post_blind／post_live／post_dead、action、deal_board）；新增選填 `player_ids`（seat → player_id）。事件格式不對回 422；格式對但籌碼或牌面與快照對不上時不報錯，當作沒給紀錄並在回應 `history` 寫 `ignored: 原因`。
+- **翻後**：有紀錄走 `WebRealtimeAgent`（session 的 mode／seconds／adaptive／multiway_bluff 生效，同手以 `hand_id` 保留記憶）；沒紀錄或代理失敗才退回 RuleBasedAgent，`approximations` 含 `rule_based_fallback`。
+- **翻前**：有紀錄用真實紀錄，並可用 adaptive 防守節點；沒紀錄維持由下注額推算（`history_inferred_from_bets`）。
+- **回應新增**：`node`（查到的節點）、`action_probs`、`history`、`approximations`（`dead_button_shifted`、`forced_post_as_limp`、`pushfold_table_has_no_ante`、`chart_has_no_ante` 等，可用來統計頻率）、`in_hand_memory`。
+- **修正**：`web_preflop.ranges` 重播時漏傳 ante，前注桌的短全下會被判不合法。
+- **推棄表前注**：求解器支援 `--ante`；48 組**尚未重算**。若資料放到 `data/preflop/pushfold_ante_0.5/`，`PushFoldAgent` 會在桌面前注落在 0.375–0.625 BB 且該人數有資料時使用（重啟 API 才載入），否則維持無前注表。
+- **已知限制**：單挑求解有最少迭代數，`seconds: 0.5` 實測單手 1–6 秒，程序冷啟動第一次約 36 秒。
+
+pkui 要配合的項目：移除 `poker_ai_api.decide_snapshot` 對 `history != []` 的拒絕並送出完整事件與 `player_ids`；`_normalize_decision` 帶出 `node`／`approximations`／`history` 寫進 trace；每手結束 `POST /sessions/{sid}/hands` 寫回牌局（第 8 項）。
+
+後續（2026-11-09）：
+- **死小盲**：`_snapshot_preflop` 在按鈕與大盲之間放一個已棄牌的空位，查多一人的表（`dead_small_blind_empty_chair`），不再退回 RuleBasedAgent。9 人桌或按鈕也空著時仍退回。
+- **極短籌碼**：推棄表補算 0.5 BB 前注的 2、3、4 BB（4 BB 不能省，否則 3.75–4 BB 會落在 3 BB 與 5 BB 的缺口），涵蓋到有效籌碼約 1.5 BB。更短的仍查翻前表。
+- **補盲**：維持當 limp。實戰約 10.6% 的牌局有補盲（179 手可判讀中 19 手）；要加節點需新的表與驗收，尚未做。
+
+未做：策略內近似（優先度低）。
+
+### 0.5 BB 前注翻前表（A9）驗收門檻（2026-11-09 00:13 CST，使用者訂定、執行前寫下，不事後調整）
+
+- 模型：以 v8.3 為基礎，只改 open、limped、option、vs_open（含 SB／BB）、bb_limped。範圍寬度（跟注與加注）× ((1.5 + 0.5n) / 1.5)^k，n 是人數；k 候選 0.15、0.25、0.35。跟注範圍上限 85%（原本已超過的不縮小），面對開池的加注範圍維持 13% 上限。下注尺寸不變。產表：`scripts/experiments/web_preflop_ante_tables.py`。
+- 線上啟用條件（通過後才接）：前注 ÷ 大盲在 0.4～0.6 才用新表，否則用 v8.3。
+- 比較：`web_policy_ab.py --baseline web_preflop_v8_3 --candidate 新表 --ante-bb 0.5 --deals 3000 --seconds 2`，同牌配對。
+- 靜態：未修改的節點和尺寸完全相同；修改的節點中沒有任何牌的繼續（跟注＋加注）或加注機率比 v8.3 低。
+- 100 BB 不變差：2–9 人 × 10 種對手（rule、station、nit、tag、lag、maniac、iso、squeeze、minraise、threebet），80 組，每組 95% CI 上界 ≥ 0。（修訂：原訂 9 種 72 組；工具實際有 10 種，使用者於正式驗收啟動前、看任何正式結果前決定全部納入。）
+- 40／150 BB 不變差：2–9 人 × {rule, lag}，32 組，每組 95% CI 上界 ≥ 0。
+- 一定要改善：6–8 人 × {rule, tag, nit}，100 BB，9 組合併後 95% CI 下界 > 0。
+- 選 k：設計種子 20261120 跑三個候選值，取 9 組合併成績最高者，平手取較小的 k。正式驗收用種子 20261121。
+- 「9 組合併」的算法：9 組平均值的平均，標準誤 = √(Σ各組標準誤²) / 9（各組視為獨立）。
+- 沒通過就不上線：維持 v8.3 並先分析，不事後調整門檻。112 組裡即使沒有差異也可能有 1～2 組偽失敗，結果照實記錄。
+- 上線後：看前 200 手的 VPIP、PFR，以及有沒有查表失敗。
+
+#### A9 結果（2026-11-09）：沒通過，線上維持 v8.3，新表未接線
+
+- 選 k（設計種子 20261120，9 組合併）：k=0.15 +24.02 [+20.53, +27.50]；k=0.25 +35.80 [+31.49, +40.12]；k=0.35 +51.74 [+46.86, +56.62]。依規則選 k=0.35（候選上限，成績隨 k 單調上升）。
+- 正式驗收（種子 20261121，k=0.35，112 組全跑完）：靜態檢查通過；「一定要改善」通過，+44.26 bb/100，CI [+39.51, +49.02]；「不變差」15 組失敗，全部在 100 BB：minraise 3–9 人共 7 組（-17.49～-39.83），threebet 2–9 人共 8 組（-17.52～-36.34）。40／150 BB 的 32 組沒有失敗。判定腳本輸出 A9 NOT PASSED。
+- 這 15 組不是偽失敗：集中在兩種對手、CI 上界都明顯小於 0，threebet 8/8、minraise 7/8 同方向。
+- 100 BB 各對手 2–9 人平均：rule +25.6、station +430.8、nit +48.9、tag +36.5、lag +22.7、maniac -1.7、iso +29.7、squeeze +19.4、minraise -23.9、threebet -29.1 bb/100。station 的數字反映模擬對手什麼都跟注，不代表實戰。
+- 失敗原因：開池放寬後（6 人 raise 29%→42%），vs_3bet／vs_4bet 依規格沒有放寬。threebet 6 人的 vs_3bet 決策 3880→5220 次，棄牌率 74%→81%；minraise 6 人的再加注節點 5458→7090 次，棄牌率 69%→72%。多開的牌大多在被 3-bet 後棄掉，付出開池金額；threebet 組以 BTN、SB 損失最大（6 人 -58、-48），minraise 組損失較分散。這正是 v8.4 門檻要測的漏洞（面對 3-bet 棄掉約 3/4 的開池範圍），放寬開池把它放大了。
+- 設計上的盲點：選 k 只看 rule、tag、nit，這三種對手都不攻擊開池範圍，所以必然選最寬的候選。
+- 候選表 `web_preflop_v8_3_ante05_k{15,25,35}.json.gz` 留在 `backend/agents/data/`，程式沒有引用。要再試需另訂新候選與新種子，不能沿用 20261120／20261121 的結果。
+
+### 0.5 BB 前注翻前表第二輪（A9d）驗收門檻（2026-11-09，使用者要求開新一輪；執行前寫下，不事後調整）
+
+- 候選：在 A9 的修改之外，再放寬多開的牌之後會遇到的節點，讓棄牌比例不因開池變寬而上升。`vs_3bet_*`（normal、cheap）與 `vs_4bet_early`／`vs_4bet_late`（只有 cheap）的**繼續寬度** × 同一個 ((1.5 + 0.5n) / 1.5)^k，上限 85%；這些節點的加注寬度和尺寸都不變。k 候選 0.15、0.25、0.35。表 `web_preflop_v8_3_ante05d_k{15,25,35}.json.gz`。
+- cold_vs_3bet、vs_4bet_cold、vs_5bet、vs_4bet:normal、all-in 節點完全不動。
+- 靜態：未修改的節點和尺寸完全相同；修改的節點中沒有任何牌的繼續或加注機率比 v8.3 低。
+- 選 k（設計種子 20261122，每組 3000 手，100 BB，每個 k 30 組）：2–9 人 × {rule, minraise, threebet} 24 組算「不變差」組（95% CI 上界 < 0 為失敗），加上 6–8 人 × {tag, nit} 6 組。取失敗組數最少者；同數取 9 組（6–8 人 × rule、tag、nit，算法同 A9）合併成績最高者；再同取較小的 k。
+- 提前停止：被選中的 k 在這 24 組有 3 組以上失敗，就不跑正式驗收，線上維持 v8.3。24 組裡最多預期 1～2 組偽失敗，3 組以上視為真問題。
+- 正式驗收（種子 20261123，只跑被選中的 k）：門檻與 A9 完全相同。100 BB 2–9 人 × 10 種對手 80 組、40／150 BB 2–9 人 × {rule, lag} 32 組，共 112 組，每組 95% CI 上界 ≥ 0；6–8 人 × {rule, tag, nit} 100 BB 9 組合併後 95% CI 下界 > 0。
+- 線上啟用條件和上線後檢查與 A9 相同。沒通過就維持 v8.3，照實記錄，不事後調整門檻。
+- 已知風險：v8.4 放寬 vs 3-bet 跟注時對 rule 3–5 人顯著變差（-2～-5 bb/100，無前注），所以 rule 2–9 人放進設計階段的不變差組。
+
+#### A9d 結果（2026-11-09）：設計階段提前停止，沒跑正式驗收，線上維持 v8.3，新表未接線
+
+- 設計種子 20261122，24 組不變差中的失敗數與 9 組合併成績（bb/100）：k=0.15 8 組，+20.24 [+16.69, +23.79]；k=0.25 10 組，+36.84 [+32.54, +41.14]；k=0.35 10 組，+51.61 [+46.70, +56.52]。依規則選 k=0.15，失敗 8 組 ≥ 3，停止；種子 20261123 未使用。
+- k=0.15 的失敗：minraise 5–9 人（-10～-21）、threebet 7–9 人（-6～-14）。rule 2–9 人三個 k 都沒有失敗，v8.4 的風險沒有出現。
+- 防守放寬有作用但不夠：vs_3bet 棄牌率回到約 v8.3 的水準（threebet 7 人 k=0.15：74%→75%），第一輪 k=0.35 的 threebet 損失 -18～-36 降到 +1～-17（種子不同，只能粗略比較）；minraise 仍 0～-32。
+- 剩下的損失不是棄牌率造成，而是多開的牌本身：繼續比例不變時，多出來的弱牌仍有約 3/4 在被任意牌再加注後棄掉，付出開池金額。
+- 結論：固定放寬開池是取捨。對不攻擊開池的對手賺（k=0.15 +20、k=0.35 +52），對任意牌再加注的探針賠，k 再小也還是有多組失敗。要同時過兩邊，得依對手被觀察到的再加注頻率決定是否放寬（與 v8.4 的「可能的下一步」同方向），這需要新門檻與新種子。
+- 候選表 `web_preflop_v8_3_ante05d_k{15,25,35}.json.gz` 留在 `backend/agents/data/`，程式沒有引用。
+
+### 快照路徑的對手資料（2026-11-09）
+
+- `CreateSession.opponent_pool`：同名 session 共用同一份對手模型，存在 `<POKER_AI_DIR>/pools/<name>.jsonl`（不含 Hero 底牌），重啟時重建。pkui 用 `qqpk`，`snapshot-decide` 帶 `player_ids`；讀不到名字的座位不送。沒有 `opponent_pool` 的 session 行為不變。
+- 只記每手 Hero 第一次翻前決策之前的動作。Hero 後面的玩家只有在有人加注時才會再出現，把後面的動作也算進去會高估他們的 3-bet 率。所以翻後統計（c-bet 等）目前沒有資料，攤牌牌也沒有。
+- 重放失敗的手牌略過，不影響決策。實際日誌 177 個第一次決策有 172 個可重放，5 個略過。
+- 目前線上真正會用到的只有 A8.3 的 iso／squeeze 防守（至少 8 次機會且頻率 ≥ 50%）。死小盲補空椅時會重新編號座位，這種手牌不使用對手模型。
+- OCR 名字不做模糊合併，同一玩家被讀成不同名字時資料會分開累積。
+- M9 的 `Exploit` 求解沒有接上：只有 2 人翻後求解器能用（`WebRealtimeAgent` 傳 `exploit=False`），證據限制版也沒通過前置精確評估。
+
+### 0.5 BB 前注翻前表第三輪：依對手切換（A9m）驗收門檻（2026-11-09，使用者選定方向；執行前寫下，不事後調整）
+
+- 候選：A9d 的 `web_preflop_v8_3_ante05d_k{15,25,35}` 只在以下條件都成立時使用，否則該次決策用 v8.3：前注 ÷ 大盲在 0.4～0.6；session 是 adaptive；桌上沒棄牌的對手裡，沒有人被判定為常再加注。
+- 判定常再加注：`OpponentModel` 的 `three_bet` 至少 8 次機會，且 (次數 + 1) / (機會 + 2) ≥ 50%（沿用 A8.3 的 iso／squeeze 門檻）。
+- 對手範圍估計（`ranges`）維持 v8.3 表，只有 Hero 自己的翻前決策換表。
+- 比較：`web_policy_ab.py --persistent-models --baseline-adaptive --candidate-adaptive --candidate-ante-switch --observe-first-decision --ante-bb 0.5 --deals 3000 --seconds 2`，同牌配對。基準是 v8.3，兩邊都累積對手資料，而且都只用 Hero 第一次翻前決策之前的動作，和線上一致。
+- 選 k（設計種子 20261124，每組 3000 手，100 BB，每個 k 30 組）：規則與 A9d 相同。2–9 人 × {rule, minraise, threebet} 24 組看失敗數，加 6–8 人 × {tag, nit} 6 組；取失敗最少者，同數取 9 組合併最高者，再同取較小的 k。被選中的 k 有 3 組以上失敗就不跑正式驗收，線上維持 v8.3。
+- 正式驗收（種子 20261125，只跑被選中的 k）：門檻與 A9 完全相同。100 BB 2–9 人 × 10 種對手 80 組、40／150 BB 2–9 人 × {rule, lag} 32 組，共 112 組，每組 95% CI 上界 ≥ 0；6–8 人 × {rule, tag, nit} 100 BB 9 組合併後 95% CI 下界 > 0。
+- 通過才設定 `web_preflop.ANTE_TABLE_PATH`；沒通過就維持 v8.3，照實記錄，不事後調整門檻。
+- 已知限制：2 人桌對手的 3-bet 機會都發生在 Hero 決策之後，這種資料收集方式看不到，所以 2 人桌永遠不會切回 v8.3。冒煙測試用種子 20261126、少量手數，結果不採計。
+- 上線後：看前 200 手的 VPIP、PFR、查表失敗，以及有多少決策切回 v8.3。
+- 執行：`out/web-realtime/a9m_run.sh`（`setsid nohup`，輸出 `a9m-run.out`，每組的 log 在 `a9m-logs/`，判定 `a9m_gate.py`）。中斷後直接重跑這支腳本，已完成的組會自動跳過，結果只由種子決定。2026-11-09 第一次執行因 WSL 重開機中斷（完成 5/90），已從中斷處接續。
+
+#### A9m 結果（2026-11-10）：未通過（112 組有 2 組失敗），線上維持 v8.3，`ANTE_TABLE_PATH` 仍是 None
+
+- 選 k（種子 20261124）：三個 k 都是 0/24 失敗；合併 k=0.15 +14.79、k=0.25 +28.01、k=0.35 +41.52 [+37.26, +45.78]，依規則選 k=0.35，沒有提前停止。
+- 正式驗收（種子 20261125，k=0.35，112 組）：靜態檢查通過。「一定要改善」通過，+43.25 bb/100，CI [+39.16, +47.34]。「不變差」失敗 2 組：100 BB maniac 5 人 -0.14 [-0.242, -0.028]、maniac 7 人 -0.05 [-0.100, -0.005]。判定腳本輸出 NOT PASSED，門檻不改。
+- 100 BB 各對手 2–9 人平均（bb/100）：rule +36.2、station +348.4、nit +40.9、tag +28.5、lag +21.0、maniac -1.3、iso +30.5、squeeze +30.8、minraise +3.1、threebet +0.9。40／150 BB 的 32 組沒有失敗。第一、二輪失敗的 minraise、threebet 這輪 16 組全部沒有失敗。
+- 失敗的兩組幾乎是同一套決策：maniac 5–9 人兩邊的開池決策數和加注率完全相同，翻前決策數只差 1–5 次（約 1.7 萬～2.8 萬次中）。差異只來自極少數手牌，配對差幾乎全是 0，所以 CI 很窄；這種稀疏差值下常態近似的 CI 也不可靠。這可能屬於規格預期的 1～2 組偽失敗，但規格同時規定沒通過就不上線，所以照實記為未通過。
+- 要上線有兩條路，都由使用者決定：明確破例（記錄為破例），或另開一輪，事先訂好不劣性邊界與新種子。不能重跑同一輪直到通過。
+- 線上資料接入已實際寫入：2026-11-10 02:25 `pools/qqpk.jsonl` 有 21 筆。
+
+### 0.5 BB 前注翻前表第四輪（A9r4）驗收門檻（2026-11-10，使用者訂定；執行前寫下，不事後調整）
+
+- 候選：A9m 的依對手切換，固定 k=0.35（`web_preflop_v8_3_ante05d_k35.json.gz`），不再選 k，也不改程式。比較方式與 A9m 相同（`out/web-realtime/a9m_ab.sh`：v8.3 基準，兩邊都累積對手資料，都只用 Hero 第一次翻前決策之前的動作，每組 3000 手，前注 0.5 BB）。
+- 種子 20261127（20261120～20261126 都已用過）。
+- 組別：與 A9m 相同的 112 組（100 BB 2–9 人 × 10 種對手 80 組，40／150 BB 2–9 人 × {rule, lag} 32 組），另做「一定要改善」的合併檢查。
+- 不變差：每組 95% CI 上界 ≥ -1 bb/100（A9m 是 ≥ 0）。
+- 一定要改善：6–8 人 × {rule, tag, nit}，100 BB，9 組合併後 95% CI 下界 > 0（算法同 A9）。
+- 停止規則：通過才設定 `web_preflop.ANTE_TABLE_PATH`；沒通過就放棄這個方向，線上維持 v8.3，不再開第五輪。
+- 執行：`out/web-realtime/a9r4_run.sh`，判定 `a9r4_gate.py`，輸出 `a9r4-run.out`。
+
+#### A9r4 結果（2026-11-11）：通過，已接上線
+
+- 112 組全部完成。不變差（上界 ≥ -1）0 組失敗；一定要改善 +42.70 bb/100，CI [+38.48, +46.91]。判定腳本輸出 PASSED。
+- 100 BB 各對手 2–9 人平均（bb/100）：rule +32.3、station +331.5、nit +42.1、tag +25.2、lag +14.5、maniac +0.3、iso +31.8、squeeze +26.7、minraise +2.0、threebet +2.0。40 BB：rule +32.8、lag +10.3；150 BB：rule +33.6、lag +17.4。
+- 照實記錄：若用 A9m 的「上界 ≥ 0」，仍有 1 組會失敗（maniac 5 人 -0.06 [-0.11, -0.00]）。單組最低平均 lag 100 BB -5.4 bb/100，但 CI 上界 ≥ 0。station 的數字反映模擬對手什麼都跟注，不代表實戰。
+- 已接線：`web_preflop.ANTE_TABLE_PATH` = `web_preflop_v8_3_ante05d_k35.json.gz`。快照 API 與網頁 agent 在前注 0.4–0.6 BB、adaptive、桌上沒有已知常再加注的對手時用這張表，否則用 v8.3；`approximations` 會出現 `ante_table`。設成 None 即可關閉。
+- `web_policy_ab.py` 結束時改為還原 `ANTE_TABLE_PATH` 的原值（原本會清成 None）。
+- 上線後檢查：前 200 手的 VPIP、PFR、查表失敗，以及多少決策切回 v8.3（`approximations` 有 `chart_has_no_ante` 而非 `ante_table`）。
+
+### pkui 找不到牌桌（2026-11-11）
+
+- QQPK 新版的牌桌視窗標題改成「德州扑克 | 常规 | $0.01/$0.02($0.01) | 桌 970」，原本記錄器只抓標題完全等於 `QQPK` 的視窗，所以偵測不到牌桌。
+- `poker_logger.window_matches`：標題完全相同，或在預設標題 `QQPK` 時，視窗屬於 `QQPK.exe`。瀏覽器裡標題含 QQPK 的頁面仍會被排除。修正後牌桌 970 立即被偵測到。
+- 從 WSL 啟動 UI 時，用 PowerShell `Start-Process` 把輸出導到 `logs/ui-stdout-*.log`／`ui-stderr-*.log`，否則看不到記錄器訊息。
+- 面對全下沒跟（2026-11-11）：對手下注超過 Hero 籌碼時，畫面只剩「棄牌」和「All in」，原本沒有任何地方認得 All in，等不到跟注按鈕就超時棄牌。現在 `poker_logger.is_allin_label`（全下／全压／All in／ALL-IN）、`state["call_is_allin"]`（輪到 Hero、沒有過牌與跟注按鈕、有 All in）→ 確認器把跟注額定為 Hero 全部籌碼 → `ui.api_decision` 允許跟注 → `operation.button_for`／`calls_allin` 把跟注對到 All in 按鈕，送出前的金額核對也接受這種情況。有跟注按鈕時 All in 不會被當成跟注。按鈕實際文字未從畫面確認，兩種語言都收。pkui 離線測試 363 項通過。
+- 第二桌仍抓不到：視窗放大到 1506×1053 時，QQPK 自己畫的標題列字體不跟著放大，OCR 讀不到桌號（縮到 998 或 1200 寬就讀得到）。新增 `poker_logger.apply_window_title`：畫面讀不到桌號時，從系統視窗標題補上桌號、級別與前注，畫面讀到的值優先。修正後 970、831 兩桌都被偵測到。pkui 離線測試 357 項通過。
+
+- 自動操作可加入其他桌（2026-11-12）：介面原本啟用自動後就鎖住牌桌下拉選單，只能全部停止再重來。現在選單一直可選：選到不在自動清單的桌，按鈕是「加入此桌」；選到已在清單的桌，按鈕是「移出此桌」；另有「全部停止」。後端 `/api/auto` 收到 `{"enabled": false, "hwnd", "table"}` 只移出那一桌（`OperationController.set_auto(False, target=...)`），最後一桌移出才整個停用；不帶 hwnd/table 仍是全部停止。
+- 自動縮牌桌視窗（2026-11-12）：記錄器每看到一個標題含「| 桌 N」的視窗，就檢查一次；畫面（client 區）比 998×699 大超過 20 px 時縮成 998×699（左上角不動、不搶焦點，最大化的先還原）。每個視窗只縮一次，之後手動放大不會被改回；大廳（標題 `QQPK`）不會被縮。關閉用 `--no-fit-window`。重開後 942 被自動縮小，970 原本就是這大小沒動。pkui 離線測試 369 項通過。
+
+### 對手資料回填驗收門檻（2026-11-12，使用者選定「從記錄補資料」；執行比對前寫下，不事後調整）
+
+- 目的：線上 qqpk 資料池只有 53 手、49 人，沒人的 3-bet 機會超過 2 次（換表判斷要 8 次），對手模型實際上沒作用。用 pkui 從 10/25 起的記錄（約 2,300 手）補資料。
+- 方法：把 `D:\pkui\logs\session-*.jsonl` 的每張畫面依序餵給線上同一套 `HandConfirmer`（含 `build_history`），在每手 Hero 第一次翻前輪到時取 `decision_snapshot`，和線上資料池記錄的時機與內容一致（只算 Hero 第一次決策前的動作）。換表門檻（8 次機會、50%）與資料池程式都不改。
+- 驗證集：線上資料池的 53 手，全部找得到對應的記錄檔與手牌編號。
+- 通過條件（全部要成立）：
+  1. 重現率：53 手中至少 45 手回放後產生快照。
+  2. 一致率：重現的手中，至少 90% 的手，每位玩家的觀察（`observe_opening` 產生的所有統計與 iso／squeeze 次數）和線上完全相同。
+  3. 3-bet 與 iso／squeeze：重現的手加總後，（機會、採取）和線上的差距合計不超過 1。
+- 通過：備份 `qqpk.jsonl` 後把回填的手（排除已在資料池的手，hand_id 以 `backfill:` 開頭）附加進去，重開 API 載入。沒通過：不寫入，資料池維持原樣，記錄原因。
+- 結果（2026-11-12）：**通過**。53 手全部重現；48 手完全一致（90.6%，門檻 90%）；3-bet 與 iso／squeeze 差距 0。5 手不一致全是回放端「不記錄這手」（Hero 第一次輪到時重建不出歷史），沒有任何一手回放算出不同的數字；其中 4 手線上本來也沒有觀察。
+- 回放 167 個記錄檔得到 1,379 個 Hero 第一次翻前輪到的快照；892 個重建不出動作歷史（籌碼對不上），線上 API 一樣不會記錄；11 個動作無法重播；53 個已在資料池。寫入 428 手（`backfill:<記錄檔>:<手號>`），資料池變成 481 手、234 人。備份：`qqpk.jsonl.bak-20261112-before-backfill`。腳本與回填檔：`out/opponent-backfill/`（`replay_logs.py` 用 WSL python3 跑 pkui 程式碼，`backfill_check.py`／`backfill_make.py` 用 `.venv`）。
+- 影響：5 位玩家的 3-bet 機會已達 8 次，但沒有人被判為常再加注（最高 哇哇叫9 1/17、Vladizmaz 0/16）；iso 機會達 8 次的有 7 人，也沒人達到積極門檻（哇哇叫9 iso 5/24）。所以照現行門檻，前注換表與 v8.2 防守都不會因回填而切換，翻前決策不變；資料顯示 QQPK 對手很少 3-bet。API 重開後才會載入。
+- 每次呼叫 API 都記錄對手（2026-11-12，使用者要求）：原本只有「Hero 第一次翻前決策、而且帶動作歷史」的那次呼叫會寫入資料池；那次沒歷史（重建失敗）時，同一手之後的呼叫也都不記錄。現在 `snapshot_decide` 只要快照帶歷史就嘗試記錄（`_has_opening` 取代 `_before_first_decision`），`observe_opening` 把歷史切在 Hero 第一次行動之前（起始籌碼仍用完整歷史推算），所以面對 4-bet、翻牌後的呼叫，記到的內容和第一次決策時相同；每手仍只記一次（hand_id 去重）。Hero 行動之後的動作照舊不算，避免高估 3-bet。小偏差：靠後續呼叫補記的手，只有 Hero 還有下一次決策才會出現。舊資料池重新載入結果不變。
+
+### 11/12 實戰檢討後的修正（2026-11-12）
+
+- 檢討報告指出的翻後問題（As5s 在 Qc Qd 5d 判成 strong 加注；3h2c 在 3d 9s 9c 價值下注；Ac2d 頂對弱踢腳跟三條街）全部來自快照 API 的 `rule_based_fallback`：pkui 沒送動作歷史時（今天 844 次呼叫中 808 次）翻後改用 `RuleBasedAgent`，不是解算器。
+- `RuleBasedAgent(board_aware=True)`：只給快照 API 的後備使用（`backend/api/ai.py`）。公牌對子上的兩對算成一對（取自己手牌組成的那一對）；頂對踢腳低於 T 為 thin（翻牌價格 ≤0.33 跟，轉牌／河牌只跟 ≤0.2）；轉牌／河牌公牌出現同花色 3 張而自己沒同花時，medium 降為 thin、thin 降為 weak。預設 False：實驗把它當對手與其他 agent 的後備，已通過的驗收依賴舊行為（`test_rule_output_unchanged_on_160_seeded_hands` 雜湊不變）。測試：`tests/test_rule_board_aware.py`。**未做 A/B 驗收**，是針對實際錯誤的規則修正。
+- 沒修：沒中牌全部過牌、沒有持續下注、聽牌只過牌或跟注（偏被動）。根本解法是讓 pkui 送得出動作歷史，翻後就會用解算器；後備規則只是保底。
+- Hero 籌碼漏讀最前面的「1」（桌 458 12:50～12:57，155↔54.5）：大部分 API 快照走估算路徑、直接用最新畫面籌碼，所以 API 深度跟著跳。`HandConfirmer._fix_dropped_digits`：每張畫面進來就和同一座位上次讀數比，只看 100～199；補上最前面的 1 後剛好接回（扣掉新增下注，差 3BB 或 3% 內），而且從上次讀數到現在底池從沒大到裝得下少掉的籌碼才補；連續補超過 90 秒（`DIGIT_FIX_MAX`）改信讀數。回放 10/25 起全部記錄：補回的畫面 3,387 張之後會再讀回高值（確實是漏讀），108 張沒有讀回（可能是真的輸掉、底池沒讀到，最多影響 90 秒）。桌 458 第 115 手 API 起始籌碼從 51BB 修正為 151BB。12:47 的 444 → 150 不是漏讀一位數的型態，沒動。pkui 離線測試 386 項通過。
+
+### 多人桌剩兩人時用解算器（A10）驗收門檻（2026-11-13，使用者選定規格與手數；執行前寫下，不事後調整）
+
+- 背景：解算器（`_WebHeadsUp`／`RealtimeAgent`）原本只在整桌只坐兩人時使用；6～9 人桌翻後就算只剩兩人，也用多人範圍勝率啟發式（HEURISTIC multiway）。
+- 候選：`WebRealtimeAgent(table_heads_up=True)`，翻後剩兩人、而且翻牌後沒有第三人行動時，交給單挑解算器（mode solve、seconds 0.5）：已棄牌玩家的籌碼當底池死錢，OOP＝按鈕之後第一個還在牌局的座位，翻前範圍照舊用網頁翻前表推算（`ranges(view)`）。整桌兩人的行為不變（`replay(view, oop=None)` 照舊用 BB）。基準：現行線上設定（翻後多人啟發式）。
+- 共同設定：`web_policy_ab.py --candidate-table-heads-up`，兩邊都 `--ante-bb 0.5 --persistent-models --baseline-adaptive --candidate-adaptive --candidate-ante-switch --observe-first-decision`，100BB，`--deals 1500`，`--seconds 0.5`，種子 20261128（20261120～20261127 都已用過）。
+- 組別：6、7、8、9 人 × {rule, station, nit, tag, lag, maniac}，共 24 組。
+- 不變差：每組 95% CI 上界 ≥ -1 bb/100。
+- 一定要改善：6～8 人 × {rule, tag, nit} 共 9 組合併（SE＝√Σse²／9），95% CI 下界 > 0。
+- 延遲（線上可行性）：A/B 之後在沒有其他負載時，用 `hu_timing.py` 的同一種手（6 人桌 UTG 開池、BB 跟注，打到河牌，8 手、預熱後計）量候選的翻後決策時間：p95 ≤ 5.0 秒、最大 ≤ 6.0 秒。理由：使用者說 QQPK 行動時間約 10 秒，通過後 pkui 翻後保底改為 9 秒，扣掉辨識約 2 秒、點擊約 0.7 秒。
+- 停止規則：任一條不通過就維持現狀（翻後用多人啟發式），記錄結果與原因；不改門檻重跑。

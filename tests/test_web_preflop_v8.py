@@ -67,6 +67,8 @@ def test_frozen_v8_and_v81_match_generator_and_cover_every_key():
     assert json.loads(json.dumps(generate(E, W, "v8.2"))) == v82 and v82["version"] == "web-v8.2-capped-defence"
     v83 = json.loads(gzip.decompress(VARIANTS["v8.3"]["path"].read_bytes()))
     assert json.loads(json.dumps(generate(E, W, "v8.3"))) == v83 and v83["version"] == "web-v8.3-priced-raises"
+    v84 = json.loads(gzip.decompress(VARIANTS["v8.4"]["path"].read_bytes()))
+    assert json.loads(json.dumps(generate(E, W, "v8.4"))) == v84 and v84["version"] == "web-v8.4-wider-vs-3bet"
 
 
 def test_v81_unopened_and_vs_open_match_100bb_at_every_depth():
@@ -228,7 +230,7 @@ def test_v8_large_raise_becomes_a_jam(monkeypatch):
     raise_all = np.zeros((169, 3))
     raise_all[:, 2] = 1
     sizing = {"raise_bb": 2.2, "raise_multiple": 2.3, "jam_fraction": .40}
-    monkeypatch.setattr(web_realtime, "lookup", lambda view, legal: (raise_all, sizing, "test"))
+    monkeypatch.setattr(web_realtime, "lookup", lambda view, legal, **_: (raise_all, sizing, "test"))
     v, legal = facing_3bet(40)          # 4-bet to 1610 >= 40% of 4000 -> jam
     assert WebRealtimeAgent(0).act(v, legal).action.amount == legal.max_raise_to
     v, legal = facing_3bet(100)         # 1610 < 40% of 10000 -> normal 4-bet
@@ -640,3 +642,122 @@ def test_v83_preflop_is_legal_against_minraise(v83, n):
                     priced += any(f"/{g}" in decision.reason for g in ("vs_3bet_", "cold_vs_3bet", "vs_4bet_", "vs_5bet"))
                 h.apply(decision.action)
     assert priced, "the probe should put the hero in at least one priced raise node"
+
+
+# ---------------------------------------------------------------- v8.4 wider vs 3-bet nodes
+
+V84_PATH = web_preflop.TABLE_PATH.with_name("web_preflop_v8_4.json.gz")
+
+
+@pytest.fixture
+def v84(monkeypatch):
+    monkeypatch.setattr(web_preflop, "TABLE_PATH", V84_PATH)
+    tables.cache_clear()
+    return tables()
+
+
+def test_v84_changes_only_vs_3bet_calls(v84):
+    v83 = web_preflop.json.loads(__import__("gzip").decompress(V83_PATH.read_bytes()))
+    assert v84["small_3bet_oop"] == 4.5 and v84["realization"] == {"ip": .85, "oop": .70}
+    assert {k: v for k, v in v84.items() if k not in ("tables", "version", "source", "small_3bet_oop", "realization")} == \
+           {k: v for k, v in v83.items() if k not in ("tables", "version", "source")}
+    assert set(v84["tables"]) == set(v83["tables"])
+    changed = {k for k in v84["tables"] if v84["tables"][k] != v83["tables"][k]}
+    assert changed and all("/vs_3bet_" in k for k in changed)
+    for k in changed:
+        new, old = (np.array(t["tables"][k]["probs"]) for t in (v84, v83))
+        np.testing.assert_allclose(new[:, 2], old[:, 2], atol=1e-4)    # same 4-bets: only calls widen
+        assert (new[:, 0] <= old[:, 0] + 1e-4).all()                 # never tighter than v8.3
+        assert new[CLASS_NAMES.index("QQ"), 0] == 0 and new[CLASS_NAMES.index("72o"), 0] == 1
+
+
+def three_bet(n, opener, three_bettor, multiple, depth=100):
+    """Everyone else folds: ``opener`` opens 2.5 BB, ``three_bettor`` 3-bets to ``multiple`` x; back to the opener."""
+    h = table(n, depth)
+    fold_to(h, opener)
+    h.apply(Action.raise_to(250))
+    fold_to(h, three_bettor)
+    h.apply(Action.raise_to(round(250 * multiple)))
+    fold_to(h, opener)
+    return h.observation(h.to_act), h.legal_actions()
+
+
+def test_postflop_order_and_position():
+    from backend.agents.web_preflop_v8 import in_position, postflop_rank
+
+    assert [postflop_rank(6, p) for p in POSITIONS[6]] == [2, 3, 4, 5, 0, 1]
+    assert postflop_rank(2, "BTN/SB") > postflop_rank(2, "BB")
+    assert in_position(three_bet(6, "BTN", "BB", 4)[0])
+    assert not in_position(three_bet(6, "CO", "BTN", 3)[0])
+    assert in_position(three_bet(2, "BTN/SB", "BB", 4)[0])
+
+
+def test_v84_out_of_position_3bet_is_small_up_to_4_5x(v84):
+    assert lookup(*three_bet(6, "LJ", "SB", 4))[2].endswith("/vs_3bet_late_small:normal")
+    assert lookup(*three_bet(6, "LJ", "BB", 4.5))[2].endswith("/vs_3bet_late_small:normal")
+    assert lookup(*three_bet(6, "LJ", "BB", 5))[2].endswith("/vs_3bet_late_large:normal")
+    assert lookup(*three_bet(6, "LJ", "BTN", 4))[2].endswith("/vs_3bet_late_large:normal")  # in position: 3.5x
+    assert lookup(*three_bet(2, "BTN/SB", "BB", 4))[2] == "2/100/BTN/SB/vs_3bet_late_small:normal"
+
+
+def test_v83_keeps_the_3_5x_boundary(v83):
+    assert lookup(*three_bet(6, "LJ", "SB", 4))[2].endswith("/vs_3bet_late_large:normal")
+
+
+def test_v84_priced_calls_realise_more_in_position(v84):
+    from backend.agents.web_preflop_v8 import priced_probs
+
+    for (opener, three, mult), share in ((("BTN", "BB", 4), .85), (("CO", "BTN", 3), .70)):
+        v, legal = three_bet(6, opener, three, mult)
+        probs, t, _ = lookup(v, legal)
+        np.testing.assert_allclose(probs, priced_probs(v, legal, t, share))
+
+
+def open_range_continue(probs, data, n, opener, depth=100):
+    w = np.array([len(c) for c in COMBOS], float)
+    reach = np.array(data["tables"][f"{n}/{depth}/{opener}/open:normal"]["probs"])[:, 2] * w
+    return (reach * (1 - probs[:, 0])).sum() / reach.sum()
+
+
+@pytest.mark.parametrize("n,opener,three", ((6, "BTN", "BB"), (6, "CO", "SB"), (2, "BTN/SB", "BB")))
+def test_v84_continues_about_half_the_open_range_vs_a_4x_blind_3bet(monkeypatch, n, opener, three):
+    shares = {}
+    for path in (V83_PATH, V84_PATH):
+        monkeypatch.setattr(web_preflop, "TABLE_PATH", path)
+        tables.cache_clear()
+        shares[path] = open_range_continue(lookup(*three_bet(n, opener, three, 4))[0], tables(), n, opener)
+    assert shares[V83_PATH] < .30 < .50 < shares[V84_PATH] < .65
+
+
+def test_threebet_probe_3bets_the_first_open_to_4x():
+    from scripts.experiments.preflop_exploiters import ThreeBetProbe
+
+    h = table(6)
+    assert "probe" not in (ThreeBetProbe(0).act(h.observation(h.to_act), h.legal_actions()).reason or "")
+    h.apply(Action.raise_to(250))       # LJ opens
+    h.apply(Action.call())              # HJ calls
+    assert ThreeBetProbe(0).act(h.observation(h.to_act), h.legal_actions()).action.amount == 250 * 5
+    h.apply(Action.raise_to(1000))      # CO 3-bets: a second raise, so no probe raise
+    assert "probe" not in (ThreeBetProbe(0).act(h.observation(h.to_act), h.legal_actions()).reason or "")
+
+
+@pytest.mark.parametrize("n", (2, 6, 9))
+def test_v84_preflop_is_legal_against_threebet(v84, n):
+    from scripts.experiments.preflop_exploiters import ThreeBetProbe
+
+    facing = 0
+    for depth in (25, 100, 150):
+        for seed in range(8):
+            h = table(n, depth, seed)
+            hero = h.to_act if seed % 2 else h.seats[seed % n]  # first to act: its opens all meet the probe
+            agents = {s: (WebRealtimeAgent(seed, mode="network", adaptive=True) if s == hero else ThreeBetProbe(seed + s))
+                      for s in h.seats}
+            while not h.is_over and h.street is Street.PREFLOP:
+                v, legal = h.observation(h.to_act), h.legal_actions()
+                decision = agents[v.seat].act(v, legal)
+                assert legal.is_legal(decision.action)
+                if v.seat == hero and decision.reason.startswith("frozen preflop"):
+                    assert decision.reason.startswith("frozen preflop web-v8.4-wider-vs-3bet")
+                    facing += "/vs_3bet_" in decision.reason
+                h.apply(decision.action)
+    assert facing, "the probe should put the hero in at least one vs 3-bet node"

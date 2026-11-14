@@ -35,7 +35,7 @@ from backend.engine.cards import cards_str
 from backend.engine.hand import EventType, PlayerView, Street
 
 from .base import Decision, StrategySource
-from .pushfold import PushFoldAgent
+from .pushfold import PushFoldAgent, blind_seats
 from .rule_based import RuleBasedAgent
 
 N = 1326
@@ -85,11 +85,13 @@ class PublicAction:
     before: StreetState
 
 
-def replay(view: PlayerView) -> tuple[list[PublicAction], StreetState, int]:
+def replay(view: PlayerView, oop: int | None = None) -> tuple[list[PublicAction], StreetState, int]:
     """All postflop actions with the state before each, the current state,
-    and the out-of-position seat (heads-up: the non-button seat)."""
+    and the out-of-position seat (heads-up: the non-button seat; pass ``oop``
+    for two players left at a bigger table)."""
     seats = [s.seat for s in view.seats]
-    oop = next(s for s in seats if s != view.button)
+    if oop is None:
+        _, oop = blind_seats(view)
     start = {s.seat: s.stack + s.total_bet for s in view.seats}
     total = {s: 0.0 for s in seats}
     bets = {s: 0.0 for s in seats}
@@ -109,6 +111,13 @@ def replay(view: PlayerView) -> tuple[list[PublicAction], StreetState, int]:
         elif e.type is EventType.POST_BLIND:
             total[e.seat] += e.amount
             bets[e.seat] += e.amount
+        elif e.type is EventType.POST_ANTE:
+            total[e.seat] += e.amount
+        elif e.type is EventType.POST_LIVE:
+            total[e.seat] += e.amount
+            bets[e.seat] += e.amount
+        elif e.type is EventType.POST_DEAD:
+            total[e.seat] += e.amount
         elif e.type is EventType.RETURN_UNCALLED:
             total[e.seat] -= e.amount
             bets[e.seat] -= e.amount
@@ -131,6 +140,18 @@ def replay(view: PlayerView) -> tuple[list[PublicAction], StreetState, int]:
                 checked = True
     st = state()
     return actions, st, oop
+
+
+def table_heads_up_oop(view: PlayerView) -> int | None:
+    """The out-of-position seat when exactly two players are left after the flop at a bigger table and
+    nobody else acted after the flop; None otherwise. First to act postflop: clockwise from the button."""
+    live = [s.seat for s in view.seats if not s.folded]
+    if view.street is Street.PREFLOP or len(live) != 2 or view.button is None:
+        return None
+    if any(e.type is EventType.ACTION and e.street is not Street.PREFLOP and e.seat not in live
+           for e in view.history):
+        return None
+    return min(live, key=lambda s: (s - view.button - 1) % 1000)
 
 
 # ----------------------------------------------------------------------------- range heuristics
@@ -186,10 +207,7 @@ def preflop_range(view: PlayerView, seat: int) -> tuple[np.ndarray, str]:
 
 def preflop_context(view: PlayerView, seat: int) -> tuple[str, str] | None:
     """(context group, outcome) of ``seat``'s last preflop action, or None."""
-    bb = None
-    for e in view.history:
-        if e.type is EventType.POST_BLIND and e.amount == view.big_blind:
-            bb = e.seat
+    _, bb = blind_seats(view)
     raises, last = 0, None
     for e in view.history:
         if e.type is not EventType.ACTION or e.street is not Street.PREFLOP:
@@ -336,6 +354,9 @@ class RealtimeAgent:
         self.seconds, self.target, self.mode = seconds, target_pct_pot, mode
         self.device, self.model_path, self.min_iterations = device, Path(model_path), min_iterations
         self._rng = random.Random(seed)
+        # Two players left at a bigger table: solve them heads-up, the folded seats' chips as dead money.
+        # Only when nobody else acted after the flop (their ranges would need a third player in the tree).
+        self.table_heads_up = False
         self._preflop = PushFoldAgent(seed)
         self._rule = RuleBasedAgent(seed)
         self._runner = None
@@ -715,12 +736,13 @@ class RealtimeAgent:
     def act(self, view: PlayerView, legal: LegalActions) -> Decision:
         if view.street is Street.PREFLOP:
             return self._preflop.act(view, legal)
-        if len(view.seats) != 2 or sum(1 for s in view.seats if not s.folded) != 2:
+        oop = table_heads_up_oop(view) if self.table_heads_up and len(view.seats) != 2 else None
+        if sum(1 for s in view.seats if not s.folded) != 2 or len(view.seats) != 2 and oop is None:
             d = self._rule.act(view, legal)
             return Decision(d.action, StrategySource.HEURISTIC, reason=f"not heads-up; {d.reason}")
         t0 = time.perf_counter()
         m = self._memory(view)
-        actions, st, oop = replay(view)
+        actions, st, oop = replay(view, oop)
         ip = next(s.seat for s in view.seats if s.seat != oop)
         spent = self._update_ranges(view, m, actions, oop, ip, budget=0.3 * self.seconds)
         me = view.seat

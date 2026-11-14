@@ -283,3 +283,93 @@ def test_agent_hand_over_builds_opponent_models():
             h.apply(agents[s].act(h.observation(s), h.legal_actions()).action)
         RealtimeAgent(hn, mode="network", opponent_models=shared).hand_over(h.observation(1))
     assert set(shared) == {0} and shared[0].hands == 5
+
+
+def test_public_hand_preserves_ante_and_rebuilds_original_stacks():
+    h = HandState({0: 1000, 1: 1000}, 0, 50, 100, Deck(3), ante=25)
+    h.apply(Action.fold())
+    hand = PublicHand.from_state(h)
+    assert hand.ante == 25 and dict(hand.start_stacks) == {0: 1000, 1: 1000}
+    assert PublicHand.from_record(hand_record(h)) == hand
+    from dataclasses import replace
+    assert PublicHand.from_view(replace(h.observation(None), sb_seat=None, bb_seat=None)) == hand
+    assert observations(hand)
+
+
+def test_forced_posts_replay_without_counting_as_voluntary_or_losing_empty_button():
+    h = HandState({1: 1000, 2: 1000, 3: 1000}, 0, 50, 100, Deck(41),
+                  blind_seats=(1, 2), forced_posts={3: (20, 30)})
+    initial_view, initial_legal = h.observation(h.to_act), h.legal_actions()
+    while not h.is_over:
+        legal = h.legal_actions()
+        h.apply(Action.fold() if h.to_act == 3 and h.street.value == 0 else
+                Action.check() if legal.can_check else Action.call())
+    hand = PublicHand.from_state(h)
+    assert hand.button == 0 and hand.sb_seat == 1 and hand.bb_seat == 2
+    assert hand.forced_posts == {3: (20, 30)}
+    assert PublicHand.from_view(h.observation(None)) == hand
+    assert PublicHand.from_record(json.loads(json.dumps(hand_record(h)))) == hand
+    obs = observations(hand)
+    assert (3, "vpip", "no", "UTG") in {(o.seat, o.group, o.outcome, o.position) for o in obs}
+    assert positions(hand.start_stacks, hand.button, hand.sb_seat, hand.bb_seat) == {
+        3: "UTG", 1: "SB", 2: "BB"
+    }
+    from backend.agents.pushfold import preflop_order
+    from backend.agents.web_preflop import position
+    from backend.agents.web_realtime import WebRealtimeAgent
+
+    view = initial_view
+    assert preflop_order(view) == [3, 1, 2]
+    assert position(view, 3) == "UTG"
+    assert WebRealtimeAgent(0).act(view, initial_legal).strategy_source.value == "heuristic"
+
+
+def test_missing_small_blind_roundtrips_and_keeps_bb_and_positions():
+    from backend.agents.pushfold import preflop_order
+    from backend.agents.web_preflop import position
+    from backend.agents.web_realtime import WebRealtimeAgent
+
+    h = HandState({1: 1000, 3: 1000, 5: 1000}, 2, 50, 100, Deck(51),
+                  blind_seats=(None, 5))
+    initial_view, initial_legal = h.observation(h.to_act), h.legal_actions()
+    assert preflop_order(initial_view) == [1, 3, 5]
+    assert position(initial_view, 1) == "UTG"
+    assert position(initial_view, 3) == "UTG+1"
+    assert position(initial_view, 5) == "BB"
+    assert WebRealtimeAgent(0).act(initial_view, initial_legal).strategy_source.value == "heuristic"
+
+    while not h.is_over:
+        legal = h.legal_actions()
+        h.apply(Action.check() if legal.can_check else Action.call())
+    hand = PublicHand.from_state(h)
+    assert hand.sb_seat is None and hand.bb_seat == 5
+    assert PublicHand.from_view(h.observation(None)) == hand
+    assert PublicHand.from_record(json.loads(json.dumps(hand_record(h)))) == hand
+    got = {(o.seat, o.group, o.outcome, o.position) for o in observations(hand)}
+    assert (5, "vpip", "no", "BB") in got
+    assert positions(hand.start_stacks, hand.button, None, hand.bb_seat) == {
+        1: "UTG", 3: "UTG1", 5: "BB"
+    }
+
+    button_hand = HandState({0: 1000, 1: 1000, 2: 1000}, 0, 50, 100, Deck(52),
+                            blind_seats=(None, 1))
+    button_view = button_hand.observation(button_hand.to_act)
+    assert preflop_order(button_view) == [2, 0, 1]
+    assert position(button_view, 2) == "UTG" and position(button_view, 0) == "BTN"
+    assert positions(button_hand.seats, 0, None, 1) == {2: "UTG", 0: "BTN", 1: "BB"}
+
+
+def test_forced_posts_skip_standard_preflop_tables_and_keep_public_ranges_unbiased():
+    from backend.agents.pushfold import PushFoldAgent
+    from backend.agents.web_preflop import lookup, ranges
+    from backend.agents.web_realtime import WebRealtimeAgent
+
+    h = HandState({0: 1000, 1: 1000, 2: 1000, 3: 1000}, 0, 50, 100, Deck(53),
+                  blind_seats=(1, 2), forced_posts={3: (25, 50)})
+    view, legal = h.observation(h.to_act), h.legal_actions()
+    assert isinstance(PushFoldAgent(0)._lookup(view), str)
+    with pytest.raises(ValueError, match="forced post"):
+        lookup(view, legal)
+    weights = ranges(view, PushFoldAgent(0))
+    assert all((weights[s] == 1).all() for s in weights)
+    assert WebRealtimeAgent(0).act(view, legal).strategy_source.value == "heuristic"

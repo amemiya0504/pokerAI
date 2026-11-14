@@ -1,7 +1,7 @@
-"""Offline generator for the web's frozen v8 / v8.1 / v8.2 / v8.3 preflop tables (schema 2).
+"""Offline generator for the web's frozen v8 / v8.1 / v8.2 / v8.3 / v8.4 preflop tables (schema 2).
 
     python -m scripts.experiments.web_preflop_v8_tables equity   # one-off: data/preflop/hu_equity_169.npz
-    python -m scripts.experiments.web_preflop_v8_tables          # writes the v8, v8.1, v8.2 and v8.3 .json.gz tables
+    python -m scripts.experiments.web_preflop_v8_tables          # writes the v8, v8.1, v8.2, v8.3 and v8.4 .json.gz tables
 
 Non-all-in nodes reuse the v7 width calibration with per-depth multipliers (HEURISTIC). All-in nodes
 store each hand's equity against an assumed jam range, computed from the 169x169 class equity matrix
@@ -20,6 +20,11 @@ ranges are narrow next to the logistic smoothing width, so even AA folded 4–31
 QQ and the stronger half of each continuing range never fold. They also ignored the price (a min 3-bet used the
 same row as a 3x one); now they store each hand's equity vs an assumed raiser range and the runtime
 also continues when that equity, discounted for realisation, covers the actual price.
+
+v8.4 = v8.3 with wider vs 3-bet nodes. v8.3 continued only about a quarter of the open range there
+(``max(.055, width x .24)`` of all hands, x .8 for a "large" 3-bet), so a 4x any-two-cards 3-bet showed
+an immediate profit. The continuing width is now a share of the open-raise range, a 3-bet from out of
+position counts as small up to 4.5x, and the priced calls realise more equity in position.
 """
 
 from __future__ import annotations
@@ -69,6 +74,12 @@ RAISER_FAMILY = {"vs_3bet": "vs_open", "cold_vs_3bet": "vs_open", "vs_4bet": "vs
                  "vs_4bet_cold": "vs_3bet", "vs_5bet": "vs_4bet"}
 # v8.3 raise nodes never fold AA, KK, QQ (this share of combos), nor the stronger half of the continuing range.
 PREMIUM_SHARE = 18 / 1326
+# v8.4 vs 3-bet nodes: continuing share of the open-raise range by 3-bettor side and 3-bet size; a 3-bet
+# from out of position counts as small up to this multiple of the open; equity realised by priced calls.
+# shortcut: hand-set toward commonly quoted solver fold-to-3-bet rates; replace with solved frequencies.
+VS_3BET_SHARE = {("late", "small"): .55, ("late", "large"): .42, ("early", "small"): .50, ("early", "large"): .38}
+SMALL_3BET_OOP = 4.5
+REALIZATION_BY_POSITION = {"ip": .85, "oop": .70}
 _FLAT = {d: (1, 1) for d in DEPTHS}
 VARIANTS = {
     "v8": {"path": V8_PATH, "version": "web-v8-depth-allin", "depth_adj": DEPTH_ADJ, "open_cap": OPEN_CAP,
@@ -89,6 +100,11 @@ VARIANTS["v8.3"] = {**VARIANTS["v8.2"], "path": Path("backend/agents/data/web_pr
                     "source": VARIANTS["v8.2"]["source"].removesuffix("; not GTO")
                     + ("; vs 3-bet/4-bet/5-bet nodes never fold the stronger half of their continuing range and also "
                        "continue when equity vs an assumed raiser range covers the actual price; not GTO")}
+VARIANTS["v8.4"] = {**VARIANTS["v8.3"], "path": Path("backend/agents/data/web_preflop_v8_4.json.gz"),
+                    "version": "web-v8.4-wider-vs-3bet", "vs_3bet_share": VS_3BET_SHARE,
+                    "source": VARIANTS["v8.3"]["source"].removesuffix("; not GTO")
+                    + ("; vs 3-bet nodes continue a share of the open-raise range, out-of-position 3-bets are small "
+                       "up to 4.5x and priced calls realise more equity in position; not GTO")}
 
 
 def ranks() -> list[float]:
@@ -103,7 +119,7 @@ def smooth(rank: float, width: float, scale: float) -> float:
     return 1 / (1 + math.exp(max(-60, min(60, (rank - width) / scale))))
 
 
-def base_widths(n: int, pos: str, group: str) -> tuple[float, float, str]:
+def base_widths(n: int, pos: str, group: str, vs_3bet_share: dict | None = None) -> tuple[float, float, str]:
     """(continue width, raise width, family) — v7 formulas for v7 groups, new ones for v8 nodes."""
     width, rfi = WIDTHS[n][POSITIONS[n].index(pos)]
     if group == "open":
@@ -153,7 +169,12 @@ def base_widths(n: int, pos: str, group: str) -> tuple[float, float, str]:
     if group.startswith("vs_3bet_"):
         _, _, who, size = group.split("_")
         defend = max(.055, width * .24) * (1.25 if who == "late" else 1) * (.80 if size == "large" else 1)
-        return defend, min(.045, defend * .35), "vs_3bet"
+        # v8.4 widens only the calls: the 4-bet width stays v8.3's, and no node gets tighter (the BB's raise
+        # width is not an open range, so its share-based width can fall below v8.3's).
+        raise_width = min(.045, defend * .35)
+        if vs_3bet_share:
+            defend = max(defend, rfi * vs_3bet_share[who, size])
+        return defend, raise_width, "vs_3bet"
     if group == "cold_vs_3bet":
         return .03, .018, "vs_3bet"
     if group.startswith("vs_4bet_") and group != "vs_4bet_cold":
@@ -179,11 +200,15 @@ def sizing(n: int, pos: str, group: str, depth: int, open_cap: dict) -> dict:
     return {"raise_bb": raise_bb, "raise_multiple": multiple, "jam_fraction": JAM_FRACTION}
 
 
-def heuristic_table(rank, n, pos, group, depth, depth_adj: dict, open_cap: dict, top_never_folds: bool = False) -> dict:
-    defend, raise_width, family = base_widths(n, pos, group)
+def heuristic_table(rank, n, pos, group, depth, depth_adj: dict, open_cap: dict, top_never_folds: bool = False,
+                    vs_3bet_share: dict | None = None, widen=None) -> dict:
+    """``widen(family, continue width, raise width)`` adjusts the final widths; sizing never changes."""
+    defend, raise_width, family = base_widths(n, pos, group, vs_3bet_share)
     dm, rm = depth_adj[family][depth]
     defend = min(1, defend * dm)
     raise_width = min(defend, raise_width * rm)
+    if widen:
+        defend, raise_width = widen(family, defend, raise_width)
     probs = []
     for ci in range(169):
         continuing = smooth(rank[ci], defend, .025)
@@ -281,6 +306,9 @@ def generate(E: np.ndarray, W: np.ndarray, variant: str = "v8.1") -> dict:
     priced = v.get("priced_raises", False)
     if priced:
         data["priced_raises"] = True
+    if v.get("vs_3bet_share"):
+        data["small_3bet_oop"] = SMALL_3BET_OOP
+        data["realization"] = dict(REALIZATION_BY_POSITION)
     for n, positions in POSITIONS.items():
         for depth in DEPTHS:
             allin = {g: allin_table(rank, E, W, n, depth, g) for g in ALLIN_GROUPS}
@@ -290,7 +318,7 @@ def generate(E: np.ndarray, W: np.ndarray, variant: str = "v8.1") -> dict:
                 for group in groups_for(n, pos):
                     # Both price keys are kept for v7 parity; v8.3 raise nodes price calls at runtime instead.
                     table = heuristic_table(rank, n, pos, group, depth, v["depth_adj"], v["open_cap"],
-                                            top_never_folds=group in raiser)
+                                            top_never_folds=group in raiser, vs_3bet_share=v.get("vs_3bet_share"))
                     if group in raiser:
                         table |= {"equity": equity[group], "raiser_width": round(raiser[group], 4)}
                     for price in ("normal", "cheap"):

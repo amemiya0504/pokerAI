@@ -16,12 +16,15 @@ from backend.engine.cards import Deck
 from backend.engine.hand import EventType, HandState, PlayerView, Street
 from backend.solver.hands import CLASS_NAMES, COMBOS, class_index
 
-from .pushfold import PushFoldAgent, preflop_order
+from .pushfold import PushFoldAgent, blind_seats, preflop_order
 
 # A8.3 passed (2026-10-27): v8.2 = v8.1 + defence nodes, read only by adaptive agents (defend=True).
 # v8.3 passed (2026-10-27): v8.2 + priced raise nodes (premiums never fold; calls when realised equity
 # covers the price). Range estimates read the same priced nodes.
 TABLE_PATH = Path(__file__).with_name("data") / "web_preflop_v8_3.json.gz"
+# A9r4 passed (2026-11-11): with a 0.4-0.6 BB ante, the wider k=0.35 table unless a live opponent is seen
+# re-raising often (WebRealtimeAgent.ante_table). None turns it off.
+ANTE_TABLE_PATH: Path | None = Path(__file__).with_name("data") / "web_preflop_v8_3_ante05d_k35.json.gz"
 POSITIONS = {
     2: ("BTN/SB", "BB"),
     3: ("BTN", "SB", "BB"),
@@ -66,7 +69,16 @@ def contexts_for(n: int, pos: str) -> tuple[str, ...]:
 
 
 def position(view: PlayerView, seat: int | None = None) -> str:
-    return POSITIONS[len(view.seats)][preflop_order(view).index(view.seat if seat is None else seat)]
+    seats = [s.seat for s in view.seats]
+    sb_seat, _ = blind_seats(view)
+    if sb_seat is None:
+        names = ((*POSITIONS[9][:len(seats) - 2], "BTN", "BB") if view.button in seats
+                 else (*POSITIONS[9][:len(seats) - 1], "BB"))
+    elif view.button in seats:
+        names = POSITIONS[len(seats)]
+    else:
+        names = (*POSITIONS[9][:len(seats) - 2], "SB", "BB")
+    return names[preflop_order(view).index(view.seat if seat is None else seat)]
 
 
 def context(view: PlayerView, legal: LegalActions) -> str:
@@ -115,8 +127,17 @@ def context(view: PlayerView, legal: LegalActions) -> str:
 
 @lru_cache(maxsize=1)
 def tables() -> dict:
-    raw = TABLE_PATH.read_bytes()
-    data = json.loads(gzip.decompress(raw) if TABLE_PATH.suffix == ".gz" else raw)
+    return _read_tables(TABLE_PATH)
+
+
+@lru_cache(maxsize=1)
+def ante_tables() -> dict | None:
+    return _read_tables(ANTE_TABLE_PATH) if ANTE_TABLE_PATH else None
+
+
+def _read_tables(path: Path) -> dict:
+    raw = path.read_bytes()
+    data = json.loads(gzip.decompress(raw) if path.suffix == ".gz" else raw)
     if data.get("schema") not in (1, 2) or data.get("hands") != list(CLASS_NAMES) or data.get("actions") != ["fold", "passive", "raise"]:
         raise ValueError("invalid frozen web preflop schema")
     if data["schema"] == 2:
@@ -141,10 +162,16 @@ def tables() -> dict:
     return data
 
 
-def lookup(view: PlayerView, legal: LegalActions, defend: bool = False) -> tuple[np.ndarray, dict, str]:
+def lookup(view: PlayerView, legal: LegalActions, defend: bool = False,
+           data: dict | None = None) -> tuple[np.ndarray, dict, str]:
     """v8.2 defence nodes only with ``defend=True`` (the adaptive agent's own choice); range
-    estimates and every other caller read the v8.1 nodes, so a v8.2 table otherwise plays as v8.1."""
-    data = tables()
+    estimates and every other caller read the v8.1 nodes, so a v8.2 table otherwise plays as v8.1.
+    ``data``: another frozen table for this decision instead of the runtime one."""
+    sb_seat, _ = blind_seats(view)
+    if view.button not in {s.seat for s in view.seats} or sb_seat is None or view.forced_posts:
+        raise ValueError("frozen preflop tables do not cover a missing button, small blind, or forced post")
+
+    data = data or tables()
     if data["schema"] == 2:
         from .web_preflop_v8 import lookup as v8_lookup
 
@@ -221,8 +248,12 @@ def ranges(view: PlayerView, pushfold: PushFoldAgent) -> dict[int, np.ndarray]:
 
     classes = np.array([class_index(int(a), int(b)) for a, b in zip(CARD_A, CARD_B)])
     weights = {s.seat: np.ones(1326) for s in view.seats}
+    sb_seat, bb_seat = blind_seats(view)
+    if view.button not in weights or sb_seat is None or view.forced_posts:
+        return weights
     replay = HandState({s.seat: s.stack + s.total_bet for s in view.seats}, view.button,
-                       view.small_blind, view.big_blind, Deck(0))
+                       view.small_blind, view.big_blind, Deck(0), ante=view.ante, blind_seats=(sb_seat, bb_seat),
+                       forced_posts=view.forced_posts)
     for e in view.history:
         if e.type is not EventType.ACTION or e.street is not Street.PREFLOP:
             continue

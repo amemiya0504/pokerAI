@@ -14,7 +14,7 @@
 | M6 · GTO Dataset Pipeline | ✅ 完成（見下方驗收結果） |
 | M7 · GTO Policy Network | ⚠️ 模仿指標達標，但策略本身仍高度可被剝削（見下方） |
 | 即時求解 Agent · A、B、C 階段 | ✅ M8 對手模型已接入；原 Arena Agent 保持基準路徑 |
-| Web AI 2–9 人 | ✅ 翻前 v8.1 通過驗收（100 BB Arena gate；40／150 BB 對 v7 配對 32 組都不顯著為負）；A8.3 依對手啟用 v8.2 防守通過驗收（2026-10-27）；v8.3 面對加注看實際賠率、AA／KK／QQ 不棄牌通過驗收（2026-10-27），目前 runtime 是 v8.3 表＋網頁 session `adaptive=True`；v8 未通過（40 BB 對 station） |
+| Web AI 2–9 人 | ✅ 翻前 v8.1 通過驗收（100 BB Arena gate；40／150 BB 對 v7 配對 32 組都不顯著為負）；A8.3 依對手啟用 v8.2 防守通過驗收（2026-10-27）；v8.3 面對加注看實際賠率、AA／KK／QQ 不棄牌通過驗收（2026-10-27），目前 runtime 是 v8.3 表＋網頁 session `adaptive=True`；v8 未通過（40 BB 對 station）；v8.4 放寬面對 3bet 未通過（2026-10-28，對 rule 3–5-max 顯著為負） |
 | M8 · Opponent Modeling | ✅ 完成（門檻版本 2、新種子重跑通過；版本 1 的結果與原因見下方「M8 驗收結果」） |
 | M9 · Exploit Engine | ⚠️ 精確前置檢查通過；Arena E1 未過、E2 通過（見下方「M9 驗收結果」） |
 | M10 | 未開始 |
@@ -232,7 +232,7 @@ BET / RAISE 的 `amount` 是「加注到」的本輪總額。全下不是獨立�
 | 零頭 | 每個底池分別平分，零頭從按鈕左側第一位贏家起依序每人 1 枚 |
 | 攤牌 | 簡化：進入攤牌的玩家全部亮牌 |
 | 按鈕 | 簡化：每手移到下一位在桌玩家；不實作死按鈕 / 補盲 |
-| Ante | 尚不支援（參數保留） |
+| Ante | 支援每人等額前注（`--ante`，單位 BB，請指定獨立的 `--out`） |
 | 離桌 / 暫離 | 牌局中提出離桌，該手結束後生效；輪到時自動過牌或棄牌。籌碼歸零者自動暫離，補籌碼後可重新加入 |
 
 ## M1 驗收結果
@@ -299,7 +299,7 @@ M2 的 AI 只有基準 Agent（隨機、跟注站），策略型 AI 從 M4 開�
 
 **資料調查（2026-10-15）**：沒有找到授權明確、且由 Solver 產生的 9-max preflop 資料。[Rizehigh/gto-preflop-trainer](https://github.com/Rizehigh/gto-preflop-trainer) 雖為 MIT 授權，但未說明頻率來源；TexasSolver 內附的 6-max 範圍，維護者表示不清楚來源與求解設定（[Issue #11](https://github.com/bupticybee/TexasSolverGPU/issues/11)）；其餘多為商業產品。因此依設計文件第 10 節自行求解，不使用來源不明的資料。
 
-**求解的遊戲**：2～9 人、等效籌碼 5／8／10／12／15／20 BB、盲注 0.5/1、無 Ante。每位玩家只能棄牌或全下（面對全下時棄牌或跟注）。全下一律打到攤牌，所以報酬是精確的 chip EV，不需要翻後模型。共 48 組設定。
+**求解的遊戲**：2～9 人、等效籌碼 5／8／10／12／15／20 BB、盲注 0.5/1；預設無 Ante，可用 `--ante` 另外求解前注版本。每位玩家只能棄牌或全下（面對全下時棄牌或跟注）。全下一律打到攤牌，所以報酬是精確的 chip EV，不需要翻後模型。共 48 組設定。
 
 **方法**：external-sampling MCCFR（線性加權），多進程同步批次。每位玩家只行動一次，所以平均策略就是各批當前策略的線性加權平均。
 
@@ -326,7 +326,7 @@ M2 的 AI 只有基準 Agent（隨機、跟注站），策略型 AI 從 M4 開�
 
 - 只涵蓋 5～20 BB 的 push/fold。深籌碼（例如 100 BB）的 preflop 需要翻後模型，計畫在 M5 的翻後 Solver 完成後再處理；在那之前，深籌碼一律標為 `HEURISTIC`。
 - 假設所有玩家籌碼相同；實際牌局取「我的籌碼與最大對手籌碼的較小值」，對應到最接近的已求解深度（相差超過 25% 就不使用）。
-- 無 Ante、chip EV（不含 ICM）。
+- 預設資料無 Ante；chip EV（不含 ICM）。
 
 ## M5 驗收結果
 
@@ -603,6 +603,12 @@ A5 range-source 配對只改 equity 的對手 range 來源：兩組使用同一�
 A6 的 pot-odds 邊界測試與 5–9-max 配對 CPU 診斷已通過；A7 增加後 `tests/test_web_realtime.py` 為 52 passed。全專案最近一次結果是 A7 前的 249 passed（652.34 秒），Arena 結束前尚未重跑全套。v7 全桌 Arena（3,000 deals × 16 組、seed 20261029）已完成並通過固定 gate：對 rule 2–9-max 依序 +41.65、+19.06、+24.48、+19.06、+7.61、+8.07、+10.85、+5.87 bb/100，其中 6、7、9-max 的 95% CI 跨 0（gate 只要求不顯著為負）；對 station 全部顯著為正；逐位置棄牌與 cheap gate 全部通過。報告：`out/web-realtime/a6-arena-v7-3000.json`。M9 的 rule 輸出、門檻、種子未修改。
 
 設計：[`docs/realtime-agent.md`](docs/realtime-agent.md)。M7 的網路策略本身高度可被剝削，所以實際對戰改成**做決策當下對子賽局求解**，網路只當備援。目前只做單挑。
+
+### 翻前 v8.4 面對 3bet 放寬（2026-10-28 驗收未通過，runtime 維持 v8.3）
+
+`backend/agents/data/web_preflop_v8_4.json.gz`：只改 vs 3bet 節點。v8.3 面對 3bet 大多只繼續 open 範圍的 22–45%（6-max BTN 被 BB 3bet 到 4 倍只繼續 27%，任意兩張牌 3bet 立刻有利可圖）。v8.4 的繼續寬度改成 open 範圍的固定比例（約 38–55%）、out of position 的 3bettor 到 4.5 倍都算小 3bet、價格放寬的實現率 in position 0.85／out of position 0.70；4bet 寬度不變。
+
+驗收（新種子 20261114，事先訂門檻，對照 v8.3＋A8.3）：新的剝削探針 `threebet`（任意兩張牌 3bet 到 4 倍）24 組全部顯著為正，100 BB 合併 +22.30 bb/100 [+18.57,+26.03]；對 nit、tag、lag、minraise 多數為正。但對 rule（以及以 rule 為基礎的 iso、squeeze）在 3–5-max 有 9 組顯著為負（−2.0 到 −5.0 bb/100），損失集中在 BTN／SB 面對盲注 3bet；maniac 8-max 也有 −0.12 顯著為負。rule 只用強牌 3bet，放寬跟注對它是虧的。依門檻，runtime 不切換。
 
 ### 翻前 v8.3 面對加注看實際賠率（2026-10-27 驗收通過，目前 runtime）
 

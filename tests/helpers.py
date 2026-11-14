@@ -26,6 +26,7 @@ def make_hand(
     board: str = "",
     small_blind: int = 50,
     big_blind: int = 100,
+    ante: int = 0,
 ) -> HandState:
     """Build a hand with chosen hole cards and board (burns use filler cards).
 
@@ -47,7 +48,7 @@ def make_hand(
         top.extend(cards)
     while len(top) < len(deal_order) * 2 + 8:
         top.append(next(filler))
-    return HandState(dict(stacks), button, small_blind, big_blind, StackedDeck(top))
+    return HandState(dict(stacks), button, small_blind, big_blind, StackedDeck(top), ante=ante)
 
 
 def play(state: HandState, *actions: str) -> None:

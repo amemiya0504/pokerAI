@@ -26,6 +26,10 @@ def view_to_dict(v: PlayerView) -> dict[str, Any]:
         "button": v.button,
         "small_blind": v.small_blind,
         "big_blind": v.big_blind,
+        "sb_seat": v.sb_seat,
+        "bb_seat": v.bb_seat,
+        "forced_posts": {str(s): list(amounts) for s, amounts in (v.forced_posts or {}).items()},
+        "ante": v.ante,
         "pot": v.pot,
         "current_bet": v.current_bet,
         "to_act": v.to_act,
@@ -44,6 +48,13 @@ def view_to_dict(v: PlayerView) -> dict[str, Any]:
 
 
 def view_from_dict(d: dict[str, Any]) -> PlayerView:
+    seat_ids = [row[0] for row in d["seats"]]
+    clockwise = seat_ids[seat_ids.index(d["button"]) + 1:] + seat_ids[:seat_ids.index(d["button"])] if d["button"] in seat_ids else []
+    if d.get("bb_seat") is None and clockwise:
+        sb_seat, bb_seat = ((d["button"], clockwise[0]) if len(seat_ids) == 2
+                            else (clockwise[0], clockwise[1]))
+    else:
+        sb_seat, bb_seat = d.get("sb_seat"), d.get("bb_seat")
     return PlayerView(
         seat=d["seat"],
         hole_cards=tuple(d["hole_cards"]),
@@ -52,6 +63,9 @@ def view_from_dict(d: dict[str, Any]) -> PlayerView:
         button=d["button"],
         small_blind=d["small_blind"],
         big_blind=d["big_blind"],
+        sb_seat=sb_seat,
+        bb_seat=bb_seat,
+        forced_posts={int(s): tuple(amounts) for s, amounts in d.get("forced_posts", {}).items()},
         pot=d["pot"],
         current_bet=d["current_bet"],
         to_act=d["to_act"],
@@ -65,6 +79,7 @@ def view_from_dict(d: dict[str, Any]) -> PlayerView:
             for t, st, seat, a, amount, cards in d["history"]
         ),
         is_over=d["is_over"],
+        ante=d.get("ante", 0),
     )
 
 
